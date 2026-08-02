@@ -173,6 +173,9 @@ def parse_args(argv):
                    help="re-tag even if the .txt caption is already non-empty")
     p.add_argument("--dry-run", action="store_true",
                    help="tag and print captions, write nothing")
+    p.add_argument("--report", action="store_true",
+                   help="print tag frequency report after the run "
+                        "(auto-enabled in --dry-run; use for real runs to audit color/tag spread)")
     return p.parse_args(argv)
 
 
@@ -371,6 +374,27 @@ def save_config(args):
     print(f"config saved to {path}")
 
 
+def print_tag_report(caption_counts: dict[str, int], total_images: int):
+    """Print tag frequency over the final captions (what the trainer sees).
+
+    Imbalance or singletons reveal imprinting risk and hallucinated tags:
+    a color on 1 image is suspicious; a color on 12 of 25 is a dominant variant.
+    """
+    if not caption_counts:
+        return
+    total = sum(caption_counts.values())
+    rows = sorted(caption_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    print(f"\ntag frequency report ({total_images} captions, {total} tags, {len(rows)} unique):")
+    for tag, n in rows[:60]:
+        print(f"  {n:3d}x  {tag}")
+    if len(rows) > 60:
+        print(f"  ... and {len(rows) - 60} more unique tags")
+    singles = [t for t, n in rows if n == 1]
+    if singles:
+        print("singletons (1 image only — rare feature or hallucination):")
+        print("  " + ", ".join(singles[:40]))
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -430,6 +454,7 @@ def main(argv=None):
           + ("  [dry-run: nothing will be written]" if args.dry_run else ""))
     tagged, failed = [], []
     done = 0
+    caption_counts: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = {ex.submit(process_one, args, img, blacklist_exact, blacklist_prefixes,
                              blacklist_suffixes, blacklist_contains, header, hint, model): img
@@ -445,6 +470,8 @@ def main(argv=None):
                 print(f"[{done}/{total}] {img}  FAILED: {e}")
                 continue
             tagged.append((img, caption))
+            for t in parse_tag_list(caption):
+                caption_counts[t] = caption_counts.get(t, 0) + 1
             print(f"[{done}/{total}] {img}  ({len(caption.split(','))} tags)")
             if args.dry_run:
                 print(f"    {caption}")
@@ -457,6 +484,8 @@ def main(argv=None):
     print(f"tagged: {len(tagged)}  skipped (already captioned): {skipped}  failed: {len(failed)}")
     if args.dry_run:
         print("dry-run: no files written")
+    if args.report or args.dry_run:
+        print_tag_report(caption_counts, len(tagged))
     if failed:
         for img, err in failed:
             logger.error("%s: %s", img, err)
