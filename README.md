@@ -58,6 +58,13 @@ works even with `*paint*` blacklisted.
 `--character`); `--hint` and `--blacklist` **merge** with config entries. Use
 `--config path/to/file.toml` for an explicit config elsewhere.
 
+**Universal recipe (variation datasets):** hint = the *family's canonical
+vocabulary*, blacklist = *whole-family wildcards*. Hint entries always survive the
+blacklist, so `hint = ["scale_mail", "chain_mail"]` + `"*scale*", "*chain*"` in
+the blacklist means variant spellings you blessed survive while invented compounds
+(`silver_scale_mail`) die — the model still picks which variant each image shows.
+Header holds only what's true on **every** image; everything else goes to hint.
+
 ## Quick start
 
 ```bash
