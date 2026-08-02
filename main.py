@@ -16,6 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import tomllib
 from PIL import Image
 
 from logger import setup_logger
@@ -111,35 +112,42 @@ def parse_args(argv):
                "  tagger . --subject outfit --trigger myoutfit\n"
                "  tagger . --character \"1girl, elf, silver_hair\" --trigger mychar\n"
                "  tagger . --subject style --trigger mystyle\n"
-               "  tagger . --hint \"face_paint\" --blacklist \"fantasy_*, ornate\"",
+               "  tagger . --hint \"face_paint\" --blacklist \"fantasy_*, ornate\"\n"
+               "  tagger . --save-config                   # persist settings to tagger.toml",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("folder", nargs="?", default=".",
                    help="folder to scan (default: current folder)")
-    p.add_argument("--subject", choices=("character", "outfit", "style"), default="character",
+    p.add_argument("--config", default=None,
+                   help="path to a tagger.toml config file; if omitted, tagger.toml "
+                        "in the target folder is auto-loaded")
+    p.add_argument("--save-config", action="store_true",
+                   help="write effective settings to tagger.toml in the folder and exit")
+    p.add_argument("--subject", choices=("character", "outfit", "style"), default=None,
                    help="what the model should focus on (default: character)")
-    p.add_argument("--trigger", default="",
+    p.add_argument("--trigger", default=None,
                    help="token prepended to every caption, e.g. mychar")
-    p.add_argument("--character", default="",
+    p.add_argument("--character", default=None,
                    help="invariant header tags true for EVERY image (e.g. \"1girl, white_hair\"); "
-                        "prepended to all captions and excluded from model output")
-    p.add_argument("--hint", default="",
+                        "prepended to all captions and excluded from model output; "
+                        "overrides config")
+    p.add_argument("--hint", default=None,
                    help="canonical vocabulary: tags to use exactly when the feature is visible, "
-                        "e.g. \"face_paint\" (never synonyms)")
-    p.add_argument("--blacklist", default="",
+                        "e.g. \"face_paint\" (never synonyms); merges with config")
+    p.add_argument("--blacklist", default=None,
                    help="extra tags to strip, comma-separated; 'foo_*' strips a whole family "
-                        "(merged with defaults)")
-    p.add_argument("--base-url", default=DEFAULT_BASE_URL,
+                        "(merges with config and defaults)")
+    p.add_argument("--base-url", default=None,
                    help=f"LM Studio API base URL (default: {DEFAULT_BASE_URL})")
-    p.add_argument("--model", default="",
+    p.add_argument("--model", default=None,
                    help="model id to use; auto-detects a qwen*-vl model if empty")
-    p.add_argument("--temperature", type=float, default=0.3,
+    p.add_argument("--temperature", type=float, default=None,
                    help="sampling temperature, low = reproducible (default: 0.3)")
-    p.add_argument("--max-tags", type=int, default=40,
+    p.add_argument("--max-tags", type=int, default=None,
                    help="cap on tags per caption (default: 40)")
-    p.add_argument("--max-size", type=int, default=1280,
+    p.add_argument("--max-size", type=int, default=None,
                    help="downscale longest side before sending (default: 1280px)")
-    p.add_argument("--workers", type=int, default=1,
+    p.add_argument("--workers", type=int, default=None,
                    help="parallel requests; LM Studio queues, keep low (default: 1)")
     p.add_argument("--limit", type=int, default=0,
                    help="process at most N images (default: all)")
@@ -262,11 +270,90 @@ def process_one(args, img: str, exact: set[str], prefixes: list[str],
     return build_caption(args.trigger, header, tags)
 
 
+def load_config(folder: str, explicit: str | None) -> tuple[dict, str | None]:
+    """Load config from explicit path or auto-detect tagger.toml in the folder."""
+    path = explicit or os.path.join(folder, "tagger.toml")
+    if not os.path.exists(path):
+        if explicit:
+            sys.exit(f"error: config file not found: {path}")
+        return {}, None
+    with open(path, "rb") as f:
+        return tomllib.load(f), path
+
+
+def resolve_args(args, cfg: dict):
+    """Merge CLI flags (winner) with config file values (defaults).
+
+    Rule: CLI overrides config for scalar settings; --hint and --blacklist are
+    additive (config entries + CLI entries).
+    """
+    if args.subject is None:
+        args.subject = cfg.get("subject", "character")
+    if args.trigger is None:
+        args.trigger = cfg.get("trigger", "")
+    if args.character is None:
+        args.character = ", ".join(c for c in cfg.get("character", []) if isinstance(c, str))
+    cfg_list = lambda key: [str(x).strip() for x in cfg.get(key, []) if str(x).strip()]
+    cli_list = lambda s: [x.strip() for x in (s or "").split(",") if x.strip()]
+    args.hint = ", ".join(cfg_list("hint") + cli_list(args.hint))
+    args.blacklist = ", ".join(cfg_list("blacklist") + cli_list(args.blacklist))
+    for attr, key, default in (("temperature", "temperature", 0.3),
+                               ("max_tags", "max_tags", 40),
+                               ("max_size", "max_size", 1280),
+                               ("workers", "workers", 1),
+                               ("base_url", "base_url", DEFAULT_BASE_URL),
+                               ("model", "model", "")):
+        if getattr(args, attr) is None:
+            setattr(args, attr, cfg.get(key, default))
+
+
+def write_toml(path: str, cfg: dict):
+    lines = []
+    for k, v in cfg.items():
+        if isinstance(v, list):
+            lines.append(f'{k} = [{ ", ".join(f'"{x}"' for x in v) }]')
+        elif isinstance(v, str):
+            lines.append(f'{k} = "{v}"')
+        else:
+            lines.append(f"{k} = {v}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def save_config(args):
+    cfg = {
+        "subject": args.subject,
+        "trigger": args.trigger,
+        "character": parse_tag_list(args.character),
+        "hint": parse_tag_list(args.hint),
+        "blacklist": parse_tag_list(args.blacklist),
+        "temperature": args.temperature,
+        "max_tags": args.max_tags,
+        "max_size": args.max_size,
+        "workers": args.workers,
+        "base_url": args.base_url,
+    }
+    if args.model:
+        cfg["model"] = args.model
+    path = os.path.join(args.folder, "tagger.toml")
+    write_toml(path, cfg)
+    print(f"config saved to {path}")
+
+
 def main(argv=None):
     args = parse_args(argv)
 
     if not os.path.isdir(args.folder):
         sys.exit(f"error: not a directory: {args.folder}")
+
+    cfg, cfg_path = load_config(args.folder, args.config)
+    if cfg_path:
+        logger.info("loaded config: %s", cfg_path)
+    resolve_args(args, cfg)
+
+    if args.save_config:
+        save_config(args)
+        return
 
     try:
         models = requests.get(f"{args.base_url.rstrip('/')}/models", timeout=10).json()["data"]

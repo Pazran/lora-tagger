@@ -14,6 +14,44 @@ changes per dataset — you steer with flags.
   default, auto-detected). API at `http://localhost:1234/v1` by default.
 - Python deps installed (already done in `venv/`): `requests`, `Pillow`.
 
+## Config file (the long command, once)
+
+Dataset settings live in a `tagger.toml` **inside the dataset folder** — the folder
+carries its own config. Save it once, then plain `tagger .` just works:
+
+```bash
+# one time, in the dataset folder:
+tagger . --subject outfit --trigger bg3_wavemother_robe \
+  --character "1girl, scale_armor, armored_dress" \
+  --hint "face_paint" \
+  --blacklist "fantasy_*, scale_mail, chain_mail" \
+  --save-config
+
+# every run after that:
+tagger . --dry-run --limit 5      # preview
+# or, when ready:
+tagger .
+```
+
+Generated `tagger.toml` (edit by hand anytime):
+
+```toml
+subject = "outfit"
+trigger = "bg3_wavemother_robe"
+character = ["1girl", "scale_armor", "armored_dress"]
+hint = ["face_paint"]
+blacklist = ["fantasy_*", "scale_mail", "chain_mail"]
+temperature = 0.3
+max_tags = 40
+max_size = 1280
+workers = 1
+base_url = "http://localhost:1234/v1"
+```
+
+**Precedence:** CLI flags override config scalars (`--subject`, `--trigger`,
+`--character`); `--hint` and `--blacklist` **merge** with config entries. Use
+`--config path/to/file.toml` for an explicit config elsewhere.
+
 ## Quick start
 
 ```bash
