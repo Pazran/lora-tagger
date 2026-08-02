@@ -24,6 +24,18 @@ from logger import setup_logger
 logger = setup_logger("lora-tagger", level="INFO", log_file="tagger.log")
 
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
+
+CYAN = "\033[36m"
+RED = "\033[31m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+
+def color(text: str, code: str) -> str:
+    """ANSI colorize when stdout is a console; plain text when piped to a file."""
+    if sys.stdout.isatty():
+        return f"{code}{text}{RESET}"
+    return text
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 # User policy: no rating tags, no quality tags, no resolution/meta noise.
