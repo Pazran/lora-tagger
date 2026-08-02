@@ -391,7 +391,7 @@ def print_tag_report(caption_counts: dict[str, int], total_images: int):
         print(f"  ... and {len(rows) - 60} more unique tags")
     singles = [t for t, n in rows if n == 1]
     if singles:
-        print("singletons (1 image only — rare feature or hallucination):")
+        print("singletons (1 image only - rare feature or hallucination):")
         print("  " + ", ".join(singles[:40]))
 
 
