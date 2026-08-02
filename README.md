@@ -58,6 +58,11 @@ works even with `*paint*` blacklisted.
 `--character`); `--hint` and `--blacklist` **merge** with config entries. Use
 `--config path/to/file.toml` for an explicit config elsewhere.
 
+**Cross-image consistency:** add `--batch-size N` to tag N images in one API call
+so the model aligns vocabulary across similar images (same feature = same tag name).
+An anti-copy rule keeps per-image differences intact. Missing images fall back to
+single calls automatically. Example: `tagger . --force --batch-size 4`.
+
 **Universal recipe (variation datasets):** hint = the *family's canonical
 vocabulary*, blacklist = *whole-family wildcards*. Hint entries always survive the
 blacklist, so `hint = ["scale_mail", "chain_mail"]` + `"*scale*", "*chain*"` in
