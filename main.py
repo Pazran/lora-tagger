@@ -472,13 +472,14 @@ def main(argv=None):
             tagged.append((img, caption))
             for t in parse_tag_list(caption):
                 caption_counts[t] = caption_counts.get(t, 0) + 1
-            print(f"[{done}/{total}] {img}  ({len(caption.split(','))} tags)")
+            print(f"{color(f'[{done}/{total}]', CYAN)} {img}  ({len(caption.split(','))} tags)")
             if args.dry_run:
-                print(f"    {caption}")
+                print(f"    {color(caption, DIM)}")
             else:
                 txt = os.path.join(args.folder, os.path.splitext(img)[0] + ".txt")
                 with open(txt, "w", encoding="utf-8") as f:
                     f.write(caption)
+            print()  # blank line between image blocks
 
     print()
     print(f"tagged: {len(tagged)}  skipped (already captioned): {skipped}  failed: {len(failed)}")
