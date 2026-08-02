@@ -179,6 +179,9 @@ def parse_args(argv):
                    help="downscale longest side before sending (default: 1280px)")
     p.add_argument("--workers", type=int, default=None,
                    help="parallel requests; LM Studio queues, keep low (default: 1)")
+    p.add_argument("--batch-size", type=int, default=1,
+                   help="tag N images in one call so the model keeps vocabulary consistent "
+                        "across similar images (default: 1 = per-image)")
     p.add_argument("--limit", type=int, default=0,
                    help="process at most N images (default: all)")
     p.add_argument("--force", action="store_true",
@@ -220,6 +223,9 @@ def system_prompt(subject: str, banned_txt: str, hint_txt: str, max_tags: int) -
         "- Pick exactly ONE color per object. Never output two color tags for the same item "
         "(e.g. do not output both blue_armor and teal_armor for the same garment). If colors "
         "are ambiguous, choose the single color that covers the largest visible area.\n"
+        "- Be consistent across images: if the same object, material, or feature appears in "
+        "multiple images, use the exact same tag name every time. Never vary the tag for the "
+        "same thing (e.g. do not use sword_back on one image and sword_backpack on another).\n"
         f"- {SUBJECT_INSTRUCTIONS[subject]}\n"
         "- Never include quality tags (masterpiece, best_quality, ...), rating tags "
         "(safe, explicit, ...), or resolution/meta tags (highres, absurdres, newest, "
@@ -435,6 +441,103 @@ def audit_folder(folder: str):
     print_tag_report(counts, captioned)
 
 
+def tag_batch(args, model: str, batch: list[tuple[str, str]], exact: set[str],
+              prefixes: list[str], suffixes: list[str], contains: list[str],
+              hint_set: set[str]) -> str:
+    """Tag multiple images in ONE call so the model aligns vocabulary across the set."""
+    names = [name for name, _ in batch]
+    payload = {
+        "model": model,
+        "temperature": args.temperature,
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "system",
+             "content": system_prompt(args.subject, render_banned(exact, prefixes,
+                                                                  suffixes, contains),
+                                      ", ".join(sorted(hint_set)) or "(none)",
+                                      args.max_tags)},
+            {"role": "user", "content": [
+                {"type": "text",
+                 "text": f"Tag these {len(batch)} images. Output one line per image, "
+                         f"starting each line with the image name and a colon, e.g.:\n"
+                         + "\n".join(f"{n}: <tags>" for n in names)
+                         + "\n\nImportant: these images are DIFFERENT (different crops, poses, "
+                           "visible details). Tag each image independently from what is visible "
+                           "in THAT image only. Never copy or reuse tags from another image "
+                           "unless that feature is actually visible in it. Use the same tag "
+                           "NAMES for the same features across images, but the tag LISTS may "
+                           "differ."},
+            ] + [{"type": "image_url",
+                  "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                 for _, b64 in batch]},
+        ],
+    }
+    r = requests.post(f"{args.base_url.rstrip('/')}/chat/completions",
+                      json=payload, timeout=600)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def parse_batch_response(raw: str, names: list[str]) -> dict[str, str]:
+    """Map model lines ('name: tags') back to image names. Best-effort; missing
+    names are omitted so the caller can fall back to a single-image call."""
+    results = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        head, tags = line.split(":", 1)
+        head = head.strip().strip("`*#").strip().strip('"')
+        if not head or not tags.strip():
+            continue
+        for n in names:
+            if head == n or head in n or n in head or head.replace(" ", "_") == n:
+                results[n] = tags
+                break
+    return results
+
+
+def process_batch(args, imgs: list[str], exact: set[str], prefixes: list[str],
+                  suffixes: list[str], contains: list[str], header: list[str],
+                  hint_set: set[str], model: str) -> dict[str, str]:
+    """Tag a batch of images; returns {img: final_caption} for images the model named."""
+    batch = [(img, image_to_b64(os.path.join(args.folder, img), args.max_size))
+             for img in imgs]
+    raw, last = None, None
+    for i in range(3):
+        try:
+            raw = tag_batch(args, model, batch, exact, prefixes, suffixes, contains, hint_set)
+            break
+        except Exception as e:
+            last = e
+            if i < 2:
+                logger.warning("batch attempt %d failed: %s; retrying", i + 1, e)
+                time.sleep(3 * (i + 1))
+    if raw is None:
+        raise last
+    excluded = set(header)
+    if args.trigger:
+        excluded.add(args.trigger)
+    return {img: build_caption(args.trigger, header,
+                               normalize_tags(tags, exact, prefixes, suffixes, contains,
+                                              excluded, hint_set, args.max_tags))
+            for img, tags in parse_batch_response(raw, imgs).items()}
+
+
+def handle_caption(args, img: str, caption: str, done: int, total: int,
+                   tagged: list, caption_counts: dict):
+    tagged.append((img, caption))
+    for t in parse_tag_list(caption):
+        caption_counts[t] = caption_counts.get(t, 0) + 1
+    print(f"{color(f'[{done}/{total}]', CYAN)} {img}  ({len(caption.split(','))} tags)")
+    if args.dry_run:
+        print(f"    {color(caption, DIM)}")
+    else:
+        txt = os.path.join(args.folder, os.path.splitext(img)[0] + ".txt")
+        with open(txt, "w", encoding="utf-8") as f:
+            f.write(caption)
+    print()  # blank line between image blocks
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -500,30 +603,61 @@ def main(argv=None):
     done = 0
     caption_counts: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(process_one, args, img, blacklist_exact, blacklist_prefixes,
-                             blacklist_suffixes, blacklist_contains, header, hint, model): img
-                   for img in jobs}
-        for fut in as_completed(futures):
-            img = futures[fut]
-            done += 1
-            try:
-                caption = fut.result()
-            except Exception as e:
-                failed.append((img, str(e)))
-                logger.error("failed %s: %s", img, e)
-                print(f"[{done}/{total}] {img}  FAILED: {e}")
-                continue
-            tagged.append((img, caption))
-            for t in parse_tag_list(caption):
-                caption_counts[t] = caption_counts.get(t, 0) + 1
-            print(f"{color(f'[{done}/{total}]', CYAN)} {img}  ({len(caption.split(','))} tags)")
-            if args.dry_run:
-                print(f"    {color(caption, DIM)}")
-            else:
-                txt = os.path.join(args.folder, os.path.splitext(img)[0] + ".txt")
-                with open(txt, "w", encoding="utf-8") as f:
-                    f.write(caption)
-            print()  # blank line between image blocks
+        if args.batch_size > 1:
+            batches = [jobs[i:i + args.batch_size]
+                       for i in range(0, len(jobs), args.batch_size)]
+            futures = {ex.submit(process_batch, args, b, blacklist_exact, blacklist_prefixes,
+                                 blacklist_suffixes, blacklist_contains, header, hint,
+                                 model): b for b in batches}
+            for fut in as_completed(futures):
+                batch = futures[fut]
+                try:
+                    results = fut.result()
+                except Exception as e:
+                    for img in batch:
+                        done += 1
+                        failed.append((img, str(e)))
+                        logger.error("failed %s: %s", img, e)
+                        print(f"{color(f'[{done}/{total}]', CYAN)} {img}  "
+                              f"{color('FAILED:', RED)} {e}")
+                        print()
+                    continue
+                for img in batch:
+                    done += 1
+                    if img in results:
+                        handle_caption(args, img, results[img], done, total, tagged,
+                                       caption_counts)
+                    else:
+                        # model skipped this image in the batch -> fall back to single call
+                        try:
+                            caption = process_one(args, img, blacklist_exact,
+                                                  blacklist_prefixes, blacklist_suffixes,
+                                                  blacklist_contains, header, hint, model)
+                        except Exception as e:
+                            failed.append((img, str(e)))
+                            logger.error("failed %s: %s", img, e)
+                            print(f"{color(f'[{done}/{total}]', CYAN)} {img}  "
+                                  f"{color('FAILED:', RED)} {e}")
+                            print()
+                            continue
+                        handle_caption(args, img, caption, done, total, tagged, caption_counts)
+        else:
+            futures = {ex.submit(process_one, args, img, blacklist_exact, blacklist_prefixes,
+                                 blacklist_suffixes, blacklist_contains, header, hint,
+                                 model): img for img in jobs}
+            for fut in as_completed(futures):
+                img = futures[fut]
+                done += 1
+                try:
+                    caption = fut.result()
+                except Exception as e:
+                    failed.append((img, str(e)))
+                    logger.error("failed %s: %s", img, e)
+                    print(f"{color(f'[{done}/{total}]', CYAN)} {img}  "
+                          f"{color('FAILED:', RED)} {e}")
+                    print()
+                    continue
+                handle_caption(args, img, caption, done, total, tagged, caption_counts)
 
     print()
     print(f"tagged: {len(tagged)}  skipped (already captioned): {skipped}  failed: {len(failed)}")
