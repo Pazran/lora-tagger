@@ -37,7 +37,11 @@ DEFAULT_BLACKLIST = {
     # resolution / meta / noise
     "absurdres", "highres", "lowres", "newest", "comment", "commentary", "text",
     "watermark", "signature", "scan", "censored", "no_humans", "no humans",
+    "none",  # Qwen emits a literal 'none' tag when it has nothing else to say
 }
+
+# VL models emit junk negative tags (no_face, no_hair, ...) on crops/absent features.
+DEFAULT_BLACKLIST_PREFIXES = ["no_"]
 
 SUBJECT_INSTRUCTIONS = {
     "character": (
@@ -48,6 +52,11 @@ SUBJECT_INSTRUCTIONS = {
         "The outfit is the main subject. Describe it in precise danbooru clothing tags: "
         "garment types, materials, patterns, colors, layering, accessories, footwear. "
         "Keep character identity tags (face, hairstyle, eye color) brief and secondary."
+    ),
+    "style": (
+        "The artistic style is the main subject. Describe the medium, rendering "
+        "technique, brushwork/lineart, color palette, lighting, and composition. "
+        "Avoid identifying specific characters, outfits, or scenes."
     ),
 }
 
@@ -64,6 +73,33 @@ def parse_tag_list(s: str) -> list[str]:
     return [t.strip().lower().replace(" ", "_") for t in s.split(",") if t.strip()]
 
 
+def split_blacklist(extra: str) -> tuple[set[str], list[str]]:
+    """Split a tag list into (exact set, wildcard prefixes).
+
+    Entries ending in '*' become prefix rules: 'fantasy_*' strips any tag starting
+    with 'fantasy_'. Merged with the built-in defaults.
+    """
+    exact = set(DEFAULT_BLACKLIST)
+    prefixes = list(DEFAULT_BLACKLIST_PREFIXES)
+    for t in parse_tag_list(extra):
+        if t.endswith("*"):
+            prefixes.append(t[:-1])
+        else:
+            exact.add(t)
+    return exact, prefixes
+
+
+def is_blacklisted(tag: str, exact: set[str], prefixes: list[str]) -> bool:
+    if tag in exact:
+        return True
+    return any(tag.startswith(p) for p in prefixes)
+
+
+def render_banned(exact: set[str], prefixes: list[str]) -> str:
+    parts = sorted(exact) + [p + "*" for p in prefixes]
+    return ", ".join(parts) or "(none)"
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="tagger",
@@ -73,20 +109,26 @@ def parse_args(argv):
                "  tagger D:\\dataset                     # tag everything (skip non-empty captions)\n"
                "  tagger . --dry-run --limit 5          # preview 5 images, write nothing\n"
                "  tagger . --subject outfit --trigger myoutfit\n"
-               "  tagger . --character \"1girl, elf, silver_hair\" --trigger mychar",
+               "  tagger . --character \"1girl, elf, silver_hair\" --trigger mychar\n"
+               "  tagger . --subject style --trigger mystyle\n"
+               "  tagger . --hint \"face_paint\" --blacklist \"fantasy_*, ornate\"",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("folder", nargs="?", default=".",
                    help="folder to scan (default: current folder)")
-    p.add_argument("--subject", choices=("character", "outfit"), default="character",
+    p.add_argument("--subject", choices=("character", "outfit", "style"), default="character",
                    help="what the model should focus on (default: character)")
     p.add_argument("--trigger", default="",
                    help="token prepended to every caption, e.g. mychar")
     p.add_argument("--character", default="",
-                   help="fixed character header tags, e.g. \"1girl, elf, silver_hair\"; "
-                        "also excluded from model output to avoid duplicates")
+                   help="invariant header tags true for EVERY image (e.g. \"1girl, white_hair\"); "
+                        "prepended to all captions and excluded from model output")
+    p.add_argument("--hint", default="",
+                   help="canonical vocabulary: tags to use exactly when the feature is visible, "
+                        "e.g. \"face_paint\" (never synonyms)")
     p.add_argument("--blacklist", default="",
-                   help="extra tags to strip, comma-separated (merged with defaults)")
+                   help="extra tags to strip, comma-separated; 'foo_*' strips a whole family "
+                        "(merged with defaults)")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL,
                    help=f"LM Studio API base URL (default: {DEFAULT_BASE_URL})")
     p.add_argument("--model", default="",
@@ -119,19 +161,24 @@ def pick_model(models: list[dict], preferred: str) -> str:
     return ids[0]
 
 
-def system_prompt(subject: str, banned: set[str], max_tags: int) -> str:
-    banned_txt = ", ".join(sorted(banned)) or "(none)"
+def system_prompt(subject: str, banned_txt: str, hint_txt: str, max_tags: int) -> str:
     return (
         "You are a precise Danbooru tagger for anime-style illustrations.\n"
         "You receive one image and must output ONLY a flat comma-separated list of Danbooru tags.\n"
         "Rules:\n"
         "- Output tags only: no sentences, no explanations, no numbering, no markdown, no code fences.\n"
         "- Danbooru conventions: lowercase, underscores instead of spaces (long_hair), singular nouns.\n"
+        "- Describe ONLY what is visible in the image. Never invent tags for features that are "
+        "cropped out, occluded, or absent (e.g. if the head is out of frame, do not output hair "
+        "or eye color tags).\n"
+        "- Use only existing Danbooru tags; never invent compound tags (e.g. fantasy_woman, "
+        "intricate_design).\n"
         f"- {SUBJECT_INSTRUCTIONS[subject]}\n"
         "- Never include quality tags (masterpiece, best_quality, ...), rating tags "
         "(safe, explicit, ...), or resolution/meta tags (highres, absurdres, newest, "
         "commentary, text, watermark).\n"
         f"- Never include these tags even if present in the image: {banned_txt}\n"
+        f"- If any of these features is visible, use exactly these tags, never synonyms: {hint_txt}\n"
         f"- Output between 10 and {max_tags} tags."
     )
 
@@ -145,15 +192,16 @@ def image_to_b64(path: str, max_size: int) -> str:
         return base64.b64encode(buf.getvalue()).decode()
 
 
-def tag_image(args, model: str, b64: str) -> str:
+def tag_image(args, model: str, b64: str, exact: set[str], prefixes: list[str],
+              hint: list[str]) -> str:
     payload = {
         "model": model,
         "temperature": args.temperature,
         "max_tokens": 1024,
         "messages": [
             {"role": "system",
-             "content": system_prompt(args.subject, DEFAULT_BLACKLIST | set(parse_tag_list(args.blacklist)),
-                                      args.max_tags)},
+             "content": system_prompt(args.subject, render_banned(exact, prefixes),
+                                      ", ".join(hint) or "(none)", args.max_tags)},
             {"role": "user", "content": [
                 {"type": "text",
                  "text": "Describe this image. Output only the comma-separated Danbooru tags."},
@@ -168,11 +216,12 @@ def tag_image(args, model: str, b64: str) -> str:
     return r.json()["choices"][0]["message"]["content"]
 
 
-def call_with_retry(args, model: str, b64: str, attempts: int = 3) -> str:
+def call_with_retry(args, model: str, b64: str, exact: set[str], prefixes: list[str],
+                    hint: list[str], attempts: int = 3) -> str:
     last = None
     for i in range(attempts):
         try:
-            return tag_image(args, model, b64)
+            return tag_image(args, model, b64, exact, prefixes, hint)
         except Exception as e:
             last = e
             if i < attempts - 1:
@@ -181,13 +230,13 @@ def call_with_retry(args, model: str, b64: str, attempts: int = 3) -> str:
     raise last
 
 
-def normalize_tags(raw: str, blacklist: set[str], excluded: set[str],
+def normalize_tags(raw: str, exact: set[str], prefixes: list[str], excluded: set[str],
                    max_tags: int) -> list[str]:
     out, seen = [], set()
     for chunk in re.split(r"[,;\n]", raw):
         t = chunk.strip().lower().replace(" ", "_")
         t = re.sub(r"[^a-z0-9_]", "", t)
-        if not t or t in blacklist or t in excluded or t in seen:
+        if not t or is_blacklisted(t, exact, prefixes) or t in excluded or t in seen:
             continue
         seen.add(t)
         out.append(t)
@@ -199,12 +248,12 @@ def build_caption(trigger: str, header: list[str], tags: list[str]) -> str:
     return ", ".join(p for p in parts if p)
 
 
-def process_one(args, img: str, blacklist: set[str], header: list[str],
-                model: str) -> str:
+def process_one(args, img: str, exact: set[str], prefixes: list[str],
+                header: list[str], hint: list[str], model: str) -> str:
     path = os.path.join(args.folder, img)
     b64 = image_to_b64(path, args.max_size)
-    raw = call_with_retry(args, model, b64)
-    tags = normalize_tags(raw, blacklist, set(header), args.max_tags)
+    raw = call_with_retry(args, model, b64, exact, prefixes, hint)
+    tags = normalize_tags(raw, exact, prefixes, set(header), args.max_tags)
     return build_caption(args.trigger, header, tags)
 
 
@@ -231,8 +280,9 @@ def main(argv=None):
     if not images:
         sys.exit(f"no images ({', '.join(sorted(IMAGE_EXTS))}) found in {args.folder}")
 
-    blacklist = DEFAULT_BLACKLIST | set(parse_tag_list(args.blacklist))
+    blacklist_exact, blacklist_prefixes = split_blacklist(args.blacklist)
     header = parse_tag_list(args.character)
+    hint = parse_tag_list(args.hint)
 
     jobs, skipped = [], 0
     for img in images:
@@ -257,7 +307,8 @@ def main(argv=None):
     tagged, failed = [], []
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(process_one, args, img, blacklist, header, model): img
+        futures = {ex.submit(process_one, args, img, blacklist_exact, blacklist_prefixes,
+                             header, hint, model): img
                    for img in jobs}
         for fut in as_completed(futures):
             img = futures[fut]
