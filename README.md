@@ -48,6 +48,12 @@ workers = 1
 base_url = "http://localhost:1234/v1"
 ```
 
+**Blacklist pattern syntax:** `foo` exact, `foo*` prefix, `*foo` suffix, `*foo*`
+any tag containing `foo` — the containing form kills whole variant families
+(`*scale*` catches `scale_mail`, `blue_scale_armor`, `silver_scale_mail`, ...).
+**Hint precedence:** hint tags always survive the blacklist, so `--hint "face_paint"`
+works even with `*paint*` blacklisted.
+
 **Precedence:** CLI flags override config scalars (`--subject`, `--trigger`,
 `--character`); `--hint` and `--blacklist` **merge** with config entries. Use
 `--config path/to/file.toml` for an explicit config elsewhere.

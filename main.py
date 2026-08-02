@@ -74,30 +74,47 @@ def parse_tag_list(s: str) -> list[str]:
     return [t.strip().lower().replace(" ", "_") for t in s.split(",") if t.strip()]
 
 
-def split_blacklist(extra: str) -> tuple[set[str], list[str]]:
-    """Split a tag list into (exact set, wildcard prefixes).
+def split_blacklist(extra: str) -> tuple[set[str], list[str], list[str], list[str]]:
+    """Split a tag list into (exact, prefixes, suffixes, contains) patterns.
 
-    Entries ending in '*' become prefix rules: 'fantasy_*' strips any tag starting
-    with 'fantasy_'. Merged with the built-in defaults.
+    'foo'   -> exact match
+    'foo*'  -> any tag starting with 'foo'
+    '*foo'  -> any tag ending with 'foo'
+    '*foo*' -> any tag containing 'foo'  (kills whole variant families)
+    Merged with the built-in defaults.
     """
     exact = set(DEFAULT_BLACKLIST)
     prefixes = list(DEFAULT_BLACKLIST_PREFIXES)
+    suffixes, contains = [], []
     for t in parse_tag_list(extra):
-        if t.endswith("*"):
+        if t.startswith("*") and t.endswith("*"):
+            core = t[1:-1]
+            if core:
+                contains.append(core)
+        elif t.startswith("*"):
+            suffixes.append(t[1:])
+        elif t.endswith("*"):
             prefixes.append(t[:-1])
         else:
             exact.add(t)
-    return exact, prefixes
+    return exact, prefixes, suffixes, contains
 
 
-def is_blacklisted(tag: str, exact: set[str], prefixes: list[str]) -> bool:
+def is_blacklisted(tag: str, exact: set[str], prefixes: list[str],
+                   suffixes: list[str], contains: list[str]) -> bool:
     if tag in exact:
         return True
-    return any(tag.startswith(p) for p in prefixes)
+    if any(tag.startswith(p) for p in prefixes):
+        return True
+    if any(tag.endswith(s) for s in suffixes):
+        return True
+    return any(c in tag for c in contains)
 
 
-def render_banned(exact: set[str], prefixes: list[str]) -> str:
-    parts = sorted(exact) + [p + "*" for p in prefixes]
+def render_banned(exact: set[str], prefixes: list[str], suffixes: list[str],
+                  contains: list[str]) -> str:
+    parts = (sorted(exact) + [p + "*" for p in prefixes]
+             + ["*" + s for s in suffixes] + ["*" + c + "*" for c in contains])
     return ", ".join(parts) or "(none)"
 
 
@@ -133,10 +150,11 @@ def parse_args(argv):
                         "overrides config")
     p.add_argument("--hint", default=None,
                    help="canonical vocabulary: tags to use exactly when the feature is visible, "
-                        "e.g. \"face_paint\" (never synonyms); merges with config")
+                        "e.g. \"face_paint\" (never synonyms); merges with config; "
+                        "hint tags always survive the blacklist")
     p.add_argument("--blacklist", default=None,
-                   help="extra tags to strip, comma-separated; 'foo_*' strips a whole family "
-                        "(merges with config and defaults)")
+                   help="extra tags to strip: 'foo' exact, 'foo*' prefix, '*foo*' any "
+                        "containing foo (merges with config and defaults)")
     p.add_argument("--base-url", default=None,
                    help=f"LM Studio API base URL (default: {DEFAULT_BASE_URL})")
     p.add_argument("--model", default=None,
@@ -201,15 +219,17 @@ def image_to_b64(path: str, max_size: int) -> str:
 
 
 def tag_image(args, model: str, b64: str, exact: set[str], prefixes: list[str],
-              hint: list[str]) -> str:
+              suffixes: list[str], contains: list[str], hint_set: set[str]) -> str:
     payload = {
         "model": model,
         "temperature": args.temperature,
         "max_tokens": 1024,
         "messages": [
             {"role": "system",
-             "content": system_prompt(args.subject, render_banned(exact, prefixes),
-                                      ", ".join(hint) or "(none)", args.max_tags)},
+             "content": system_prompt(args.subject, render_banned(exact, prefixes,
+                                                                  suffixes, contains),
+                                      ", ".join(sorted(hint_set)) or "(none)",
+                                      args.max_tags)},
             {"role": "user", "content": [
                 {"type": "text",
                  "text": "Describe this image. Output only the comma-separated Danbooru tags."},
@@ -225,11 +245,12 @@ def tag_image(args, model: str, b64: str, exact: set[str], prefixes: list[str],
 
 
 def call_with_retry(args, model: str, b64: str, exact: set[str], prefixes: list[str],
-                    hint: list[str], attempts: int = 3) -> str:
+                    suffixes: list[str], contains: list[str], hint_set: set[str],
+                    attempts: int = 3) -> str:
     last = None
     for i in range(attempts):
         try:
-            return tag_image(args, model, b64, exact, prefixes, hint)
+            return tag_image(args, model, b64, exact, prefixes, suffixes, contains, hint_set)
         except Exception as e:
             last = e
             if i < attempts - 1:
@@ -238,13 +259,21 @@ def call_with_retry(args, model: str, b64: str, exact: set[str], prefixes: list[
     raise last
 
 
-def normalize_tags(raw: str, exact: set[str], prefixes: list[str], excluded: set[str],
-                   max_tags: int) -> list[str]:
+def normalize_tags(raw: str, exact: set[str], prefixes: list[str],
+                   suffixes: list[str], contains: list[str], excluded: set[str],
+                   hint_set: set[str], max_tags: int) -> list[str]:
     out, seen = [], set()
     for chunk in re.split(r"[,;\n]", raw):
         t = chunk.strip().lower().replace(" ", "_")
         t = re.sub(r"[^a-z0-9_]", "", t)
-        if not t or is_blacklisted(t, exact, prefixes) or t in excluded or t in seen:
+        if not t or t in seen or t in excluded:
+            continue
+        if t in hint_set:
+            # canonical vocabulary always wins over the blacklist
+            seen.add(t)
+            out.append(t)
+            continue
+        if is_blacklisted(t, exact, prefixes, suffixes, contains):
             continue
         seen.add(t)
         out.append(t)
@@ -257,16 +286,18 @@ def build_caption(trigger: str, header: list[str], tags: list[str]) -> str:
 
 
 def process_one(args, img: str, exact: set[str], prefixes: list[str],
-                header: list[str], hint: list[str], model: str) -> str:
+                suffixes: list[str], contains: list[str], header: list[str],
+                hint_set: set[str], model: str) -> str:
     path = os.path.join(args.folder, img)
     b64 = image_to_b64(path, args.max_size)
-    raw = call_with_retry(args, model, b64, exact, prefixes, hint)
+    raw = call_with_retry(args, model, b64, exact, prefixes, suffixes, contains, hint_set)
     # The trigger and header are prepended by the script; never let the model
     # duplicate them (VL models sometimes echo the subject name back).
     excluded = set(header)
     if args.trigger:
         excluded.add(args.trigger)
-    tags = normalize_tags(raw, exact, prefixes, excluded, args.max_tags)
+    tags = normalize_tags(raw, exact, prefixes, suffixes, contains, excluded,
+                          hint_set, args.max_tags)
     return build_caption(args.trigger, header, tags)
 
 
@@ -372,9 +403,10 @@ def main(argv=None):
     if not images:
         sys.exit(f"no images ({', '.join(sorted(IMAGE_EXTS))}) found in {args.folder}")
 
-    blacklist_exact, blacklist_prefixes = split_blacklist(args.blacklist)
+    blacklist_exact, blacklist_prefixes, blacklist_suffixes, blacklist_contains = \
+        split_blacklist(args.blacklist)
     header = parse_tag_list(args.character)
-    hint = parse_tag_list(args.hint)
+    hint = set(parse_tag_list(args.hint))
 
     jobs, skipped = [], 0
     for img in images:
@@ -400,7 +432,7 @@ def main(argv=None):
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = {ex.submit(process_one, args, img, blacklist_exact, blacklist_prefixes,
-                             header, hint, model): img
+                             blacklist_suffixes, blacklist_contains, header, hint, model): img
                    for img in jobs}
         for fut in as_completed(futures):
             img = futures[fut]
