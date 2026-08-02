@@ -253,7 +253,12 @@ def process_one(args, img: str, exact: set[str], prefixes: list[str],
     path = os.path.join(args.folder, img)
     b64 = image_to_b64(path, args.max_size)
     raw = call_with_retry(args, model, b64, exact, prefixes, hint)
-    tags = normalize_tags(raw, exact, prefixes, set(header), args.max_tags)
+    # The trigger and header are prepended by the script; never let the model
+    # duplicate them (VL models sometimes echo the subject name back).
+    excluded = set(header)
+    if args.trigger:
+        excluded.add(args.trigger)
+    tags = normalize_tags(raw, exact, prefixes, excluded, args.max_tags)
     return build_caption(args.trigger, header, tags)
 
 
