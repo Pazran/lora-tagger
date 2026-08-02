@@ -188,6 +188,9 @@ def parse_args(argv):
     p.add_argument("--report", action="store_true",
                    help="print tag frequency report after the run "
                         "(auto-enabled in --dry-run; use for real runs to audit color/tag spread)")
+    p.add_argument("--audit", action="store_true",
+                   help="no tagging: print the tag frequency report over EXISTING .txt captions "
+                        "(the human review pass; works without LM Studio)")
     return p.parse_args(argv)
 
 
@@ -407,6 +410,28 @@ def print_tag_report(caption_counts: dict[str, int], total_images: int):
         print("  " + ", ".join(singles[:40]))
 
 
+def audit_folder(folder: str):
+    """Human review pass: report tag frequency over existing captions, no API calls."""
+    image_stems = {os.path.splitext(f)[0] for f in os.listdir(folder)
+                   if os.path.splitext(f)[1].lower() in IMAGE_EXTS}
+    counts: dict[str, int] = {}
+    captioned = 0
+    for f in sorted(os.listdir(folder), key=natural_key):
+        if not f.lower().endswith(".txt"):
+            continue
+        stem = f[:-4]
+        if stem not in image_stems:
+            continue
+        content = open(os.path.join(folder, f), encoding="utf-8").read().strip()
+        if not content:
+            continue
+        captioned += 1
+        for t in parse_tag_list(content):
+            counts[t] = counts.get(t, 0) + 1
+    print(f"auditing existing captions: {captioned} non-empty .txt found")
+    print_tag_report(counts, captioned)
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -420,6 +445,10 @@ def main(argv=None):
 
     if args.save_config:
         save_config(args)
+        return
+
+    if args.audit:
+        audit_folder(args.folder)
         return
 
     try:
