@@ -188,10 +188,14 @@ tagger . --ui export     # 5. OneTrainer config, patched from your last config
 - **split** — seeded random split, click any thumbnail to move it between
   train/val, then apply: copies into `train/` + `val/` (originals untouched,
   refuses to clobber an existing split) or writes `split.json` only.
-- **export** — builds `onetrainer_config.json` in the dataset folder. Uses your
-  most recent OneTrainer config (auto-detected from `OneTrainer_Workspace`) as
-  the template so your tuned pipeline propagates, and patches only the
-  dataset-specific fields (concept path, trigger, output name, epochs/lr/rank).
+- **export** — builds `onetrainer_config.json` in the dataset folder. Template
+  is auto-detected: (1) a OneTrainer preset/config whose filename matches the
+  dataset (e.g. `bg3_tav_law-IllustriousXL.json` for a `bg3_*` dataset,
+  scanned from both `OneTrainer/training_presets` and
+  `OneTrainer_Workspace/config`), (2) a previous `onetrainer_config.json` in
+  the dataset folder, (3) the most recent run config. Only dataset-specific
+  fields are patched (concept path, trigger, output name, epochs/lr/rank);
+  epochs default to ~100 steps/image from the photo count (repeats=1).
 
 ## Full pipeline (compose with renamer)
 

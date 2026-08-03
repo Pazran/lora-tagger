@@ -1813,23 +1813,48 @@ def split_apply(folder: str, assignment: dict, mode: str) -> dict:
             "dirs": ["train", "val"] if mode == "copy" else []}
 
 
-def detect_base_config(folder: str) -> str:
-    """Find a previous OneTrainer config to use as the export template."""
-    cand = os.path.join(folder, "onetrainer_config.json")
-    if os.path.isfile(cand):
-        return cand
-    for _ in range(3):
-        parent = os.path.dirname(folder)
-        if parent == folder:
+def detect_base_config(folder: str, trigger: str = "") -> str:
+    """Find the best OneTrainer config/preset to use as the export template.
+
+    Priority: (1) a preset/config whose filename matches the dataset
+    (e.g. 'bg3' in bg3_tav_law-IllustriousXL.json), (2) a previous
+    onetrainer_config.json inside the dataset folder, (3) the newest
+    config/preset found via parent folders (workspace configs and the
+    OneTrainer install's training_presets).
+    """
+    import re as _re
+    local = os.path.join(folder, "onetrainer_config.json")
+    tokens = set(t for t in _re.split(r"[^a-z0-9]+",
+                 ((trigger or "").lower() + " " + os.path.basename(folder).lower()))
+                 if len(t) > 2)
+    cands = []  # (mtime, path, name)
+    cur = os.path.abspath(folder)
+    while True:
+        for sub in ("OneTrainer_Workspace/config", "OneTrainer/training_presets"):
+            base = os.path.join(cur, sub)
+            if os.path.isdir(base):
+                for f in os.listdir(base):
+                    if f.lower().endswith(".json") and not f.startswith("#"):
+                        p = os.path.join(base, f)
+                        try:
+                            cands.append((os.path.getmtime(p), p, f))
+                        except OSError:
+                            pass
+        parent = os.path.dirname(cur)
+        if parent == cur:
             break
-        ws = os.path.join(parent, "OneTrainer_Workspace", "config")
-        if os.path.isdir(ws):
-            cfgs = sorted(os.path.join(ws, f) for f in os.listdir(ws)
-                          if f.endswith(".json"))
-            if cfgs:
-                return cfgs[-1]
-        folder = parent
-    return ""
+        cur = parent
+    if cands:
+        matched = [c for c in cands if any(t in c[2].lower() for t in tokens)]
+        if matched:
+            return max(matched, key=lambda c: c[0])[1]
+        if os.path.isfile(local):
+            return local
+        ws = [c for c in cands if "OneTrainer_Workspace" in c[1]]
+        if ws:
+            return max(ws, key=lambda c: c[0])[1]
+        return max(cands, key=lambda c: c[0])[1]
+    return local if os.path.isfile(local) else ""
 
 
 def one_trainer_concept(folder: str, name: str) -> dict:
@@ -2099,7 +2124,8 @@ def make_app_handler(folder: str):
                     EXPORT_HTML.replace("{{FOLDER}}", folder).encode("utf-8"),
                     "text/html; charset=utf-8")
             if parsed.path == "/api/export-hints":
-                base = detect_base_config(folder)
+                cfg, _ = load_config(folder, None)
+                base = detect_base_config(folder, cfg.get("trigger", ""))
                 save_dir = ""
                 base_cfg = {}
                 if base:
@@ -2109,7 +2135,6 @@ def make_app_handler(folder: str):
                         save_dir = os.path.dirname(base_cfg.get("output_model_destination") or "")
                     except Exception:
                         base_cfg = {}
-                cfg, _ = load_config(folder, None)
                 has_split = os.path.isdir(os.path.join(folder, "train"))
                 concept_dir = os.path.join(folder, "train") if has_split else folder
                 n = 0
