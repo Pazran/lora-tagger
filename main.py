@@ -1369,6 +1369,21 @@ EXPORT_HTML = r"""<!doctype html>
   .field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:#999; margin-bottom:10px; }
   .field input { background:#131313; color:#ddd; border:1px solid #444; border-radius:6px; padding:6px 10px; font-size:13px; }
   .field input[type=number] { width:140px; }
+  .pathentry { display:flex; gap:8px; }
+  .pathentry input { flex:1; }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.65); align-items:center; justify-content:center; z-index:50; }
+  .modal-box { background:#1b1b1b; border:1px solid #3a3a3a; border-radius:10px; width:600px; max-width:94vw; max-height:80vh; display:flex; flex-direction:column; overflow:hidden; }
+  .modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid #2c2c2c; font-size:12px; color:#999; }
+  .modal-head .path { word-break:break-all; }
+  .modal-nav { display:flex; gap:8px; padding:8px 14px; border-bottom:1px solid #2c2c2c; }
+  .modal-nav .grow { flex:1; }
+  #blist { list-style:none; margin:0; padding:6px 0; overflow:auto; font-size:13px; }
+  #blist li { padding:7px 14px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #blist li:hover { background:#2a2a2a; }
+  #blist li.dir { color:#ddd; }
+  #blist li.file { color:#9ecbff; }
+  #blist li.placeholder { color:#666; cursor:default; }
+  #blist li.placeholder:hover { background:none; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 16px; }
   @media (max-width:700px) { .grid2 { grid-template-columns:1fr; } }
   .btn { background:#2a2a2a; color:#ddd; border:1px solid #3a3a3a; border-radius:6px; padding:7px 16px; font-size:13px; cursor:pointer; }
@@ -1392,10 +1407,11 @@ EXPORT_HTML = r"""<!doctype html>
     <div class="desc">Builds <code>onetrainer_config.json</code> in the dataset folder. Uses your last OneTrainer config as the
       template (your tuned pipeline propagates) and patches only the dataset-specific fields. Everything else — review it in the OneTrainer UI.</div>
     <div class="field"><label>base config (template) — auto-detected</label>
-      <input id="base" type="text" placeholder="path to a previous OneTrainer config.json"></div>
+      <div class="pathentry"><input id="base" type="text" placeholder="path to a previous OneTrainer config.json"><button class="btn" onclick="openBrowser('config')">browse…</button></div></div>
     <div class="field"><label>trigger — comes from tagger.toml</label><input id="trigger" type="text" readonly></div>
     <div class="grid2">
-      <div class="field"><label>save dir</label><input id="saveDir" type="text" placeholder="where the .safetensors goes"></div>
+      <div class="field"><label>save dir</label>
+        <div class="pathentry"><input id="saveDir" type="text" placeholder="where the .safetensors goes"><button class="btn" onclick="openBrowser('dir')">browse…</button></div></div>
       <div class="field"><label>resolution</label><input id="resolution" type="number" value="1024"></div>
       <div class="field"><label>epochs</label><input id="epochs" type="number" value=""></div>
       <div class="field"><label>learning rate</label><input id="lr" type="number" step="0.00001" value=""></div>
@@ -1408,6 +1424,17 @@ EXPORT_HTML = r"""<!doctype html>
   <div class="result" id="result"></div>
   <pre id="json" style="display:none"></pre>
   <div style="margin-top:8px"><button class="btn" id="copyBtn" style="display:none" onclick="copy()">copy JSON</button></div>
+</div>
+<div class="modal" id="browser" style="display:none">
+  <div class="modal-box">
+    <div class="modal-head"><span class="path" id="bpath"></span><button class="btn" onclick="closeBrowser()">✕</button></div>
+    <div class="modal-nav">
+      <button class="btn" id="bup" onclick="browseUp()">⬆ up</button>
+      <div class="grow"></div>
+      <button class="btn primary" id="bselect" onclick="browserSelect()" style="display:none">select this folder</button>
+    </div>
+    <ul id="blist"></ul>
+  </div>
 </div>
 <script>
 "use strict";
@@ -1459,6 +1486,52 @@ function copy() {
   byId('copyBtn').textContent = 'copied ✓';
   setTimeout(() => byId('copyBtn').textContent = 'copy JSON', 1500);
 }
+
+/* folder browser */
+const browser = { mode: 'dir', target: null, path: '' };
+
+async function openBrowser(mode) {
+  browser.mode = mode;
+  browser.target = mode === 'config' ? 'base' : 'saveDir';
+  byId('browser').style.display = 'flex';
+  await browseGo(byId(browser.target).value || '');
+}
+
+async function browseGo(p) {
+  const ext = browser.mode === 'config' ? '.json' : '';
+  const d = await (await fetch('/api/browse?path=' + encodeURIComponent(p) + '&ext=' + ext)).json();
+  if (!d.ok) { alert(d.error); closeBrowser(); return; }
+  browser.path = d.path;
+  browser.parent = d.parent;
+  byId('bpath').textContent = d.path;
+  byId('bup').style.visibility = d.parent ? 'visible' : 'hidden';
+  byId('bselect').style.display = browser.mode === 'dir' ? 'inline-block' : 'none';
+  const ul = byId('blist');
+  ul.innerHTML = '';
+  if (!d.dirs.length && !d.files.length) {
+    const li = document.createElement('li');
+    li.className = 'placeholder'; li.textContent = '(empty)'; ul.appendChild(li);
+  }
+  for (const dir of d.dirs) {
+    const li = document.createElement('li');
+    li.className = 'dir'; li.textContent = '📁 ' + dir.name;
+    li.onclick = () => browseGo(dir.path);
+    ul.appendChild(li);
+  }
+  for (const f of d.files) {
+    const li = document.createElement('li');
+    li.className = 'file'; li.textContent = '📄 ' + f.name;
+    li.onclick = () => { byId(browser.target).value = f.path; closeBrowser(); };
+    ul.appendChild(li);
+  }
+}
+
+async function browseUp() { if (browser.parent) await browseGo(browser.parent); }
+function browserSelect() { if (browser.mode === 'dir') { byId(browser.target).value = browser.path; closeBrowser(); } }
+function closeBrowser() { byId('browser').style.display = 'none'; }
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBrowser(); });
+document.addEventListener('click', e => { if (e.target.id === 'browser') closeBrowser(); });
 
 init();
 </script>
@@ -1820,6 +1893,35 @@ ONETRAINER_SKELETON = {
 }
 
 
+def browse(path: str = "", ext: str = "") -> dict:
+    """List a directory for the export page's folder browser (read-only).
+
+    ext filters files (e.g. '.json'); pass '' for directories-only mode.
+    Returns full paths so the JS never has to join path segments.
+    """
+    if not path or not os.path.isdir(path):
+        if path:  # given path missing -> climb to nearest existing ancestor
+            while path and not os.path.isdir(path):
+                path = os.path.dirname(path)
+        if not path:
+            path = os.path.expanduser("~")
+    try:
+        entries = sorted(os.listdir(path))
+    except PermissionError:
+        return {"ok": False, "error": f"permission denied: {path}"}
+    dirs, files = [], []
+    for e in entries:
+        full = os.path.join(path, e)
+        if os.path.isdir(full):
+            dirs.append({"name": e, "path": full})
+        elif ext and e.lower().endswith(ext):
+            files.append({"name": e, "path": full})
+    parent = os.path.dirname(path)
+    return {"ok": True, "path": path,
+            "parent": parent if parent != path else None,
+            "dirs": dirs, "files": files}
+
+
 def export_config(folder: str, params: dict) -> dict:
     """Build a OneTrainer config: last config as template (or skeleton), patched
     with dataset-specific fields. Writes onetrainer_config.json into the folder."""
@@ -1980,6 +2082,10 @@ def make_app_handler(folder: str):
                                    "trigger": cfg.get("trigger", ""),
                                    "save_dir": save_dir,
                                    "has_split": os.path.isdir(os.path.join(folder, "train"))})
+            if parsed.path == "/api/browse":
+                qs = urllib.parse.parse_qs(parsed.query)
+                return self._json(browse(qs.get("path", [""])[0],
+                                         qs.get("ext", [""])[0]))
             if parsed.path.startswith("/img/"):
                 name = os.path.basename(
                     urllib.parse.unquote(parsed.path[len("/img/"):]))
