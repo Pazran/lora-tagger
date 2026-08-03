@@ -982,7 +982,7 @@ function generateWords() {
     if (!state.words.includes(w)) state.words.push(w);
     for (const p of wildcardize(w)) if (!state.blacklist.includes(p)) state.blacklist.push(p);
   }
-  renderWords(); renderBlacklist(); renderWordsPreview(); onAnyChange();
+  renderChipsW(); renderChipsBL(); renderWordsPreview(); onAnyChange();
 }
 function removeWord(w) {
   const pats = wildcardize(w);
