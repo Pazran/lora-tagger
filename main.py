@@ -691,7 +691,7 @@ load();
 </html>"""
 
 
-SETUP_HTML = """<!doctype html>
+SETUP_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
