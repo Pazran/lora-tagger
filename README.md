@@ -22,15 +22,15 @@ carries its own config. Save it once, then plain `tagger .` just works:
 ```bash
 # one time, in the dataset folder:
 tagger . --subject outfit --trigger bg3_wavemother_robe \
-  --character "1girl, scale_armor, armored_dress" \
+  --character "1girl" \
   --hint "face_paint" \
-  --blacklist "fantasy_*, scale_mail, chain_mail" \
+  --blacklist "*armor*, *scale*, *chain*, *dress*, *gown*, *trim*, barefoot" \
   --save-config
 
 # every run after that:
-tagger . --dry-run --limit 5      # preview
+tagger . --dry-run --force --limit 5   # preview (--force needed if all captioned)
 # or, when ready:
-tagger .
+tagger . --force --batch-size 4
 ```
 
 Generated `tagger.toml` (edit by hand anytime):
@@ -38,9 +38,10 @@ Generated `tagger.toml` (edit by hand anytime):
 ```toml
 subject = "outfit"
 trigger = "bg3_wavemother_robe"
-character = ["1girl", "scale_armor", "armored_dress"]
-hint = ["face_paint"]
-blacklist = ["fantasy_*", "scale_mail", "chain_mail"]
+character = ["1girl"]                  # invariant ONLY — no outfit words (see schools below)
+hint = ["face_paint"]                 # identity that varies per image; survives *paint*
+blacklist = ["*armor*", "*scale*", "*chain*", "*dress*", "*gown*", "*trim*",
+             "*glove*", "*boot*", "*slit*", "*sword*", "barefoot"]
 temperature = 0.3
 max_tags = 40
 max_size = 1280
@@ -63,23 +64,47 @@ so the model aligns vocabulary across similar images (same feature = same tag na
 An anti-copy rule keeps per-image differences intact. Missing images fall back to
 single calls automatically. Example: `tagger . --force --batch-size 4`.
 
-**Universal recipe (variation datasets):** hint = the *family's canonical
-vocabulary*, blacklist = *whole-family wildcards*. Hint entries always survive the
-blacklist, so `hint = ["scale_mail", "chain_mail"]` + `"*scale*", "*chain*"` in
-the blacklist means variant spellings you blessed survive while invented compounds
-(`silver_scale_mail`) die — the model still picks which variant each image shows.
-Header holds only what's true on **every** image; everything else goes to hint.
+## Two schools: tag the subject, or let the trigger own it
+
+**School 1 — tag everything visible** (decomposable): the subject is described
+in tags (`blue_armor, scale_mail, gold_trim`). You keep prompt-level control —
+recolor, swap pieces, address variants per color. Cost: **leakage** — the model
+learns it can render the subject from the tags alone, so the trigger word fires
+weakly by itself.
+
+**School 2 — the trigger owns the subject** (fidelity): blacklist the whole
+subject vocabulary (`*armor*`, `*scale*`, `*chain*`, ...) and leave the subject
+untagged. Every feature binds 100% to the trigger; captions shrink to
+`trigger, 1girl, [identity], [context]`. Max trigger fidelity, zero color/
+material hedging — but no prompt-level control, and variants blend into a
+family average.
+
+> Empirical: on a 25-image outfit set, School 1 produced a **generic outfit**
+> when the trigger was prompted alone — the robe only fired when a color tag
+> was also prompted. Flipping to School 2 fixed it.
+
+Rule of thumb: small datasets and identity-first goals → **School 2**.
+Control-first (recolorable, addressable variants) → **School 1**, and then the
+per-image tags must be human-verified (see `--audit`).
+
+**Universal recipe:** pick a school first. School 2: blacklist = the whole
+subject family (`*scale*`, `*chain*`), hint = identity that varies per image and
+must stay taggable (`face_paint` survives `*paint*` via hint-precedence).
+School 1: hint = the family's canonical vocabulary, blacklist = whole-family
+wildcards, header holds only what's true on **every** image. Hint entries
+always survive the blacklist in either school.
 
 ## Quick start
 
 ```bash
 # from any directory (D:/Scripts must be on PATH)
 tagger D:\dataset                       # tag all images, skip non-empty captions
-tagger . --dry-run --limit 5            # preview 5 images, write nothing
+tagger . --dry-run --force --limit 5    # preview 5 images, write nothing
 tagger . --subject outfit --trigger myoutfit
 tagger . --character "1girl, elf, silver_hair" --trigger mychar
 tagger . --subject style --trigger mystyle
 tagger . --hint "face_paint" --blacklist "fantasy_*, ornate"
+tagger . --audit                        # frequency report over existing captions (no API)
 ```
 
 ## Full pipeline (compose with renamer)
@@ -135,9 +160,14 @@ Built-in prompt rules apply to every dataset:
 | `--max-tags` | `40` | cap on tags per caption |
 | `--max-size` | `1280` | downscale longest side before sending |
 | `--workers` | `1` | parallel requests (LM Studio queues; keep low) |
+| `--batch-size` | `1` | N images per API call → consistent vocabulary across similar images |
 | `--limit` | all | process at most N images |
 | `--force` | off | re-tag non-empty captions |
 | `--dry-run` | off | print captions, write nothing |
+| `--audit` | off | print tag-frequency report over existing captions (no API) |
+| `--report` | off | print tag-frequency report after tagging |
+| `--save-config` | off | write `tagger.toml` into the dataset folder and exit |
+| `--config` | auto | explicit config path instead of auto-loading `tagger.toml` |
 
 ## Troubleshooting
 
