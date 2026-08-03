@@ -156,6 +156,43 @@ tagger . --setup
 
 `--init-config` remains for headless scaffold; `--setup` is the interactive way.
 
+## The web UI (tagdeck)
+
+`--review` and `--setup` are two pages of a local web app — **tagdeck** — that
+now covers the whole 0 → training-ready pipeline. All pages share one server
+and one port; the header nav moves between them. No LM Studio needed for any
+of them:
+
+```bash
+tagger . --review     # 1. thumbnails + editable captions, singleton flags
+```
+
+```bash
+tagger . --setup      # 2. plain-word questions -> tagger.toml
+```
+
+```bash
+tagger . --ui validate   # 3. dataset health checks
+```
+
+```bash
+tagger . --ui split      # 4. train/val split (copy or manifest)
+```
+
+```bash
+tagger . --ui export     # 5. OneTrainer config, patched from your last config
+```
+
+- **validate** — pairing, corrupt images, pixel duplicates, trigger coverage,
+  blacklist leakage (respecting hint-precedence), duplicate tags in one caption.
+- **split** — seeded random split, click any thumbnail to move it between
+  train/val, then apply: copies into `train/` + `val/` (originals untouched,
+  refuses to clobber an existing split) or writes `split.json` only.
+- **export** — builds `onetrainer_config.json` in the dataset folder. Uses your
+  most recent OneTrainer config (auto-detected from `OneTrainer_Workspace`) as
+  the template so your tuned pipeline propagates, and patches only the
+  dataset-specific fields (concept path, trigger, output name, epochs/lr/rank).
+
 ## Full pipeline (compose with renamer)
 
 ```bash
@@ -216,6 +253,7 @@ Built-in prompt rules apply to every dataset:
 | `--audit` | off | print tag-frequency report over existing captions (no API) |
 | `--review` | off | human review grid in the browser (no API) |
 | `--setup` | off | config wizard in the browser — plain-word questions that generate `tagger.toml` (no API) |
+| `--ui NAME` | — | open a tagdeck page: `review` \| `setup` \| `validate` \| `split` \| `export` |
 | `--port` | `8765` | port for `--review` |
 | `--no-browser` | off | with `--review`: don't auto-open the browser |
 | `--report` | off | print tag-frequency report after tagging |

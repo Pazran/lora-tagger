@@ -8,10 +8,13 @@ next to each image — the standard kohya/ai-toolkit dataset layout.
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
+import random
 import re
+import shutil
 import sys
 import time
 import urllib.parse
@@ -212,6 +215,8 @@ def parse_args(argv):
     p.add_argument("--setup", action="store_true",
                    help="open the config wizard in the browser: plain-word questions that "
                         "generate tagger.toml (no LM Studio needed)")
+    p.add_argument("--ui", choices=["review", "setup", "validate", "split", "export"],
+                   help="open a tagdeck page in the browser (no LM Studio needed)")
     p.add_argument("--port", type=int, default=8765,
                    help="port for the --review web UI (default: 8765)")
     p.add_argument("--no-browser", action="store_true",
@@ -515,6 +520,9 @@ REVIEW_HTML = """<!doctype html>
   header { position:sticky; top:0; z-index:10; background:#1b1b1b; border-bottom:1px solid #2c2c2c; padding:10px 16px; }
   h1 { font-size:15px; margin:0 0 8px; color:#fff; font-weight:600; }
   h1 small { color:#888; font-weight:400; }
+  .nav { display:flex; gap:12px; font-size:13px; margin-bottom:8px; }
+  .nav a { color:#69db7c; text-decoration:none; }
+  .nav a.on { color:#fff; text-decoration:underline; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .stats { font-size:13px; color:#aaa; }
   .chips { display:flex; gap:6px; flex-wrap:wrap; }
@@ -546,7 +554,8 @@ REVIEW_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>tagger review <small>— {{FOLDER}}</small></h1>
+  <h1>tagdeck review <small>— {{FOLDER}}</small></h1>
+  <div class="nav"><a class="on" href="/">review</a><a href="/setup">setup</a><a href="/validate">validate</a><a href="/split">split</a><a href="/export">export</a></div>
   <div class="row">
     <span class="stats" id="stats"></span>
     <select id="filter">
@@ -555,7 +564,6 @@ REVIEW_HTML = """<!doctype html>
       <option value="ok">captioned only</option>
       <option value="empty">empty / missing</option>
     </select>
-    <a class="btn" href="/setup">⚙ setup wizard</a>
     <button class="btn" onclick="load()">↻ refresh flags</button>
     <span style="font-size:12px;color:#666" id="shown"></span>
   </div>
@@ -706,6 +714,7 @@ SETUP_HTML = r"""<!doctype html>
   h1 small { color:#888; font-weight:400; }
   .nav { margin-top:6px; display:flex; gap:10px; font-size:13px; }
   .nav a { color:#69db7c; text-decoration:none; }
+  .nav a.on { color:#fff; text-decoration:underline; }
   .wrap { max-width:880px; margin:0 auto; padding:20px 16px; }
   section { background:#1b1b1b; border:1px solid #2c2c2c; border-radius:10px; padding:14px 16px; margin-bottom:14px; }
   section h2 { font-size:13px; margin:0 0 4px; color:#fff; text-transform:uppercase; letter-spacing:.5px; }
@@ -749,8 +758,8 @@ SETUP_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>tagger setup <small>— {{FOLDER}}</small></h1>
-  <div class="nav"><a href="/">← review grid</a></div>
+  <h1>tagdeck setup <small>— {{FOLDER}}</small></h1>
+  <div class="nav"><a href="/">review</a><a class="on" href="/setup">setup</a><a href="/validate">validate</a><a href="/split">split</a><a href="/export">export</a></div>
 </header>
 <div class="wrap">
 
@@ -1128,6 +1137,335 @@ init();
 </html>"""
 
 
+VALIDATE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tagdeck validate — {{FOLDER}}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#141414; color:#ddd; padding-bottom:40px; }
+  header { position:sticky; top:0; z-index:10; background:#1b1b1b; border-bottom:1px solid #2c2c2c; padding:10px 16px; }
+  h1 { font-size:15px; margin:0 0 6px; color:#fff; font-weight:600; }
+  h1 small { color:#888; font-weight:400; }
+  .nav { display:flex; gap:12px; font-size:13px; }
+  .nav a { color:#69db7c; text-decoration:none; }
+  .nav a.on { color:#fff; text-decoration:underline; }
+  .wrap { max-width:880px; margin:0 auto; padding:20px 16px; }
+  .summary { font-size:14px; margin-bottom:14px; color:#ccc; }
+  .check { background:#1b1b1b; border:1px solid #2c2c2c; border-left:4px solid #666; border-radius:8px; padding:10px 14px; margin-bottom:10px; }
+  .check.ok { border-left-color:#69db7c; }
+  .check.warn { border-left-color:#ffd43b; }
+  .check.fail { border-left-color:#ff6b6b; }
+  .check .head { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; }
+  .check .name { font-size:14px; color:#fff; font-weight:600; }
+  .check .status { font-size:10px; font-weight:700; letter-spacing:.5px; padding:2px 8px; border-radius:8px; }
+  .check.ok .status { background:#1d2b1d; color:#69db7c; }
+  .check.warn .status { background:#2a2410; color:#ffd43b; }
+  .check.fail .status { background:#2b1414; color:#ff8787; }
+  .check .msg { font-size:13px; color:#aaa; }
+  .check .toggle { background:none; border:1px solid #3a3a3a; color:#999; border-radius:6px; padding:2px 10px; font-size:12px; cursor:pointer; margin-top:8px; }
+  .check .toggle:hover { background:#2a2a2a; }
+  .check ul { margin:8px 0 0; padding-left:20px; font-size:12.5px; color:#bbb; max-height:180px; overflow:auto; }
+  .check li { margin:2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tagdeck validate <small>— {{FOLDER}}</small></h1>
+  <div class="nav"><a href="/">review</a><a href="/setup">setup</a><a class="on" href="/validate">validate</a><a href="/split">split</a><a href="/export">export</a></div>
+</header>
+<div class="wrap">
+  <div class="summary" id="summary"></div>
+  <div id="checks"></div>
+</div>
+<script>
+"use strict";
+const byId = id => document.getElementById(id);
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+async function load() {
+  const d = await (await fetch('/api/validate')).json();
+  const counts = { ok: 0, warn: 0, fail: 0 };
+  d.checks.forEach(c => counts[c.status]++);
+  byId('summary').textContent = d.images + ' images · ' + d.checks.length + ' checks · '
+    + counts.ok + ' ok · ' + counts.warn + ' warn · ' + counts.fail + ' fail';
+  const el = byId('checks');
+  el.innerHTML = '';
+  for (const c of d.checks) el.appendChild(card(c));
+}
+
+function card(c) {
+  const el = document.createElement('div');
+  el.className = 'check ' + c.status;
+  const head = document.createElement('div');
+  head.className = 'head';
+  const name = document.createElement('span'); name.className = 'name'; name.textContent = c.name;
+  const st = document.createElement('span'); st.className = 'status'; st.textContent = c.status.toUpperCase();
+  const msg = document.createElement('span'); msg.className = 'msg'; msg.textContent = c.message;
+  head.appendChild(name); head.appendChild(st); head.appendChild(msg);
+  el.appendChild(head);
+  if (c.items && c.items.length) {
+    const btn = document.createElement('button');
+    btn.className = 'toggle';
+    btn.textContent = 'show ' + c.items.length + ' details';
+    const ul = document.createElement('ul');
+    ul.style.display = 'none';
+    for (const it of c.items) { const li = document.createElement('li'); li.textContent = it; ul.appendChild(li); }
+    btn.onclick = () => { const show = ul.style.display === 'none'; ul.style.display = show ? 'block' : 'none'; btn.textContent = (show ? 'hide' : 'show') + ' details'; };
+    el.appendChild(btn); el.appendChild(ul);
+  }
+  return el;
+}
+
+load();
+</script>
+</body>
+</html>"""
+
+
+SPLIT_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tagdeck split — {{FOLDER}}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#141414; color:#ddd; padding-bottom:40px; }
+  header { position:sticky; top:0; z-index:10; background:#1b1b1b; border-bottom:1px solid #2c2c2c; padding:10px 16px; }
+  h1 { font-size:15px; margin:0 0 6px; color:#fff; font-weight:600; }
+  h1 small { color:#888; font-weight:400; }
+  .nav { display:flex; gap:12px; font-size:13px; }
+  .nav a { color:#69db7c; text-decoration:none; }
+  .nav a.on { color:#fff; text-decoration:underline; }
+  .wrap { max-width:980px; margin:0 auto; padding:20px 16px; }
+  .controls { display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap; background:#1b1b1b; border:1px solid #2c2c2c; border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  .field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:#999; }
+  .field input { background:#131313; color:#ddd; border:1px solid #444; border-radius:6px; padding:6px 10px; font-size:13px; width:90px; }
+  .radios { display:flex; gap:14px; align-items:center; font-size:13px; }
+  .btn { background:#2a2a2a; color:#ddd; border:1px solid #3a3a3a; border-radius:6px; padding:7px 16px; font-size:13px; cursor:pointer; }
+  .btn:hover { background:#333; }
+  .btn.primary { background:#2b4a2b; border-color:#69db7c; color:#c8f7c8; }
+  .btn.primary:hover { background:#345c34; }
+  .counts { font-size:13px; color:#ccc; }
+  .counts b { color:#fff; }
+  .result { background:#1d2b1d; border:1px solid #69db7c; color:#c8f7c8; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:14px; display:none; }
+  .result.err { background:#2b1414; border-color:#ff6b6b; color:#ff8787; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:12px; }
+  .card { background:#1b1b1b; border:2px solid #2c2c2c; border-radius:10px; overflow:hidden; cursor:pointer; }
+  .card.train { border-color:#3a5a3a; }
+  .card.val { border-color:#5a4a1f; }
+  .card img { width:100%; aspect-ratio:4/3; object-fit:contain; background:#000; display:block; }
+  .card .row { display:flex; justify-content:space-between; align-items:center; gap:6px; padding:5px 8px; font-size:11px; color:#999; }
+  .badge { font-size:10px; font-weight:700; padding:2px 8px; border-radius:8px; }
+  .badge.train { background:#1d2b1d; color:#69db7c; }
+  .badge.val { background:#2a2410; color:#ffd43b; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tagdeck split <small>— {{FOLDER}}</small></h1>
+  <div class="nav"><a href="/">review</a><a href="/setup">setup</a><a href="/validate">validate</a><a class="on" href="/split">split</a><a href="/export">export</a></div>
+</header>
+<div class="wrap">
+  <div class="controls">
+    <div class="field"><label>val %</label><input id="percent" type="number" min="1" max="50" value="10"></div>
+    <div class="field"><label>seed</label><input id="seed" type="number" value="42"></div>
+    <div class="radios">
+      <label><input type="radio" name="mode" value="copy" checked> copy into train/ + val/</label>
+      <label><input type="radio" name="mode" value="manifest"> manifest only (split.json)</label>
+    </div>
+    <button class="btn" onclick="preview()">↻ re-assign</button>
+    <button class="btn primary" onclick="apply()">apply split</button>
+    <span class="counts" id="counts"></span>
+  </div>
+  <div class="result" id="result"></div>
+  <div class="grid" id="grid"></div>
+</div>
+<script>
+"use strict";
+const byId = id => document.getElementById(id);
+const state = { assignment: {}, counts: null };
+
+async function preview() {
+  const p = byId('percent').value || 10, s = byId('seed').value || 42;
+  const d = await (await fetch('/api/split-preview?percent=' + p + '&seed=' + s)).json();
+  state.assignment = {};
+  state.counts = d.counts;
+  d.images.forEach(i => state.assignment[i.name] = i.set);
+  render();
+}
+
+function render() {
+  byId('counts').innerHTML = 'train <b>' + Object.values(state.assignment).filter(v => v === 'train').length +
+    '</b> · val <b>' + Object.values(state.assignment).filter(v => v === 'val').length + '</b> · click an image to move it';
+  const grid = byId('grid');
+  grid.innerHTML = '';
+  for (const [name, set] of Object.entries(state.assignment)) {
+    const el = document.createElement('div');
+    el.className = 'card ' + set;
+    el.onclick = () => { state.assignment[name] = state.assignment[name] === 'train' ? 'val' : 'train'; render(); };
+    const img = document.createElement('img');
+    img.src = '/img/' + encodeURIComponent(name) + '?size=180';
+    img.loading = 'lazy';
+    const row = document.createElement('div'); row.className = 'row';
+    const nm = document.createElement('span'); nm.textContent = name;
+    const badge = document.createElement('span'); badge.className = 'badge ' + set; badge.textContent = set.toUpperCase();
+    row.appendChild(nm); row.appendChild(badge);
+    el.appendChild(img); el.appendChild(row);
+    grid.appendChild(el);
+  }
+}
+
+async function apply() {
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  const r = await fetch('/api/split-apply', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ assignment: state.assignment, mode })
+  });
+  const j = await r.json();
+  const res = byId('result');
+  res.style.display = 'block';
+  if (j.ok) {
+    res.className = 'result';
+    res.textContent = 'applied: ' + j.counts.train + ' train / ' + j.counts.val + ' val' +
+      (j.dirs.length ? ' → copied into ' + j.dirs.join(' + ') + '/' : ' → split.json written') + ' (safe: originals untouched)';
+  } else {
+    res.className = 'result err';
+    res.textContent = j.error || 'split failed';
+  }
+}
+
+preview();
+</script>
+</body>
+</html>"""
+
+
+EXPORT_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tagdeck export — {{FOLDER}}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#141414; color:#ddd; padding-bottom:40px; }
+  header { position:sticky; top:0; z-index:10; background:#1b1b1b; border-bottom:1px solid #2c2c2c; padding:10px 16px; }
+  h1 { font-size:15px; margin:0 0 6px; color:#fff; font-weight:600; }
+  h1 small { color:#888; font-weight:400; }
+  .nav { display:flex; gap:12px; font-size:13px; }
+  .nav a { color:#69db7c; text-decoration:none; }
+  .nav a.on { color:#fff; text-decoration:underline; }
+  .wrap { max-width:880px; margin:0 auto; padding:20px 16px; }
+  section { background:#1b1b1b; border:1px solid #2c2c2c; border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  section h2 { font-size:13px; margin:0 0 8px; color:#fff; text-transform:uppercase; letter-spacing:.5px; }
+  .desc { font-size:12.5px; color:#999; margin:0 0 10px; line-height:1.5; }
+  .field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:#999; margin-bottom:10px; }
+  .field input { background:#131313; color:#ddd; border:1px solid #444; border-radius:6px; padding:6px 10px; font-size:13px; }
+  .field input[type=number] { width:140px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 16px; }
+  @media (max-width:700px) { .grid2 { grid-template-columns:1fr; } }
+  .btn { background:#2a2a2a; color:#ddd; border:1px solid #3a3a3a; border-radius:6px; padding:7px 16px; font-size:13px; cursor:pointer; }
+  .btn:hover { background:#333; }
+  .btn.primary { background:#2b4a2b; border-color:#69db7c; color:#c8f7c8; }
+  .btn.primary:hover { background:#345c34; }
+  .result { background:#1d2b1d; border:1px solid #69db7c; color:#c8f7c8; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:14px; display:none; }
+  .result.err { background:#2b1414; border-color:#ff6b6b; color:#ff8787; }
+  pre { background:#0d0d0d; border:1px solid #333; border-radius:8px; padding:12px; font:12px/1.5 ui-monospace,monospace; color:#9ecbff; overflow-x:auto; max-height:420px; }
+  label.check { font-size:13px; display:flex; gap:8px; align-items:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tagdeck export <small>— {{FOLDER}}</small></h1>
+  <div class="nav"><a href="/">review</a><a href="/setup">setup</a><a href="/validate">validate</a><a href="/split">split</a><a class="on" href="/export">export</a></div>
+</header>
+<div class="wrap">
+  <section>
+    <h2>OneTrainer config</h2>
+    <div class="desc">Builds <code>onetrainer_config.json</code> in the dataset folder. Uses your last OneTrainer config as the
+      template (your tuned pipeline propagates) and patches only the dataset-specific fields. Everything else — review it in the OneTrainer UI.</div>
+    <div class="field"><label>base config (template) — auto-detected</label>
+      <input id="base" type="text" placeholder="path to a previous OneTrainer config.json"></div>
+    <div class="field"><label>trigger — comes from tagger.toml</label><input id="trigger" type="text" readonly></div>
+    <div class="grid2">
+      <div class="field"><label>save dir</label><input id="saveDir" type="text" placeholder="where the .safetensors goes"></div>
+      <div class="field"><label>resolution</label><input id="resolution" type="number" value="1024"></div>
+      <div class="field"><label>epochs</label><input id="epochs" type="number" value=""></div>
+      <div class="field"><label>learning rate</label><input id="lr" type="number" step="0.00001" value=""></div>
+      <div class="field"><label>lora rank</label><input id="rank" type="number" value=""></div>
+      <div class="field"><label>lora alpha</label><input id="alpha" type="number" step="0.5" value=""></div>
+    </div>
+    <label class="check"><input id="useSplit" type="checkbox"> point the concept at train/ (use the split)</label>
+    <div style="margin-top:12px"><button class="btn primary" onclick="generate()">generate + save</button></div>
+  </section>
+  <div class="result" id="result"></div>
+  <pre id="json" style="display:none"></pre>
+  <div style="margin-top:8px"><button class="btn" id="copyBtn" style="display:none" onclick="copy()">copy JSON</button></div>
+</div>
+<script>
+"use strict";
+const byId = id => document.getElementById(id);
+
+async function init() {
+  const h = await (await fetch('/api/export-hints')).json();
+  byId('base').value = h.base_config || '';
+  byId('trigger').value = h.trigger || '';
+  byId('saveDir').value = h.save_dir || '';
+  byId('useSplit').checked = !!h.has_split;
+}
+
+function num(id) {
+  const v = byId(id).value.trim();
+  return v === '' ? '' : v;
+}
+
+async function generate() {
+  const body = {
+    base_config: byId('base').value.trim(),
+    trigger: byId('trigger').value.trim(),
+    save_dir: byId('saveDir').value.trim(),
+    resolution: num('resolution'), epochs: num('epochs'), lr: num('lr'),
+    rank: num('rank'), alpha: num('alpha'), use_split: byId('useSplit').checked,
+  };
+  const r = await fetch('/api/export-config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  const j = await r.json();
+  const res = byId('result');
+  res.style.display = 'block';
+  if (j.ok) {
+    res.className = 'result';
+    res.textContent = 'saved: ' + j.path;
+    byId('json').style.display = 'block';
+    byId('json').textContent = JSON.stringify(j.config, null, 2);
+    byId('copyBtn').style.display = 'inline-block';
+  } else {
+    res.className = 'result err';
+    res.textContent = j.error || 'export failed';
+  }
+}
+
+function copy() {
+  const t = byId('json').textContent;
+  if (navigator.clipboard) { navigator.clipboard.writeText(t).catch(() => {}); }
+  else { const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+  byId('copyBtn').textContent = 'copied ✓';
+  setTimeout(() => byId('copyBtn').textContent = 'copy JSON', 1500);
+}
+
+init();
+</script>
+</body>
+</html>"""
+
+
 META_JUNK = ["watermark", "signature", "censored", "commentary", "translated",
              "bad_id", "bad_pixiv_id", "score_*", "rating_*", "text_focus",
              "logo", "monochrome", "greyscale", "multiple_views", "reference_sheet"]
@@ -1214,6 +1552,308 @@ def setup_save(folder: str, body: dict) -> dict:
         f.write("\n".join(lines) + "\n")
     logger.info("setup wizard wrote config: %s", path)
     return {"ok": True, "path": path}
+
+
+def validate_folder(folder: str) -> dict:
+    """Dataset health checks: pairing, corrupt images, pixel dupes, trigger
+    coverage, blacklist leakage, duplicate tags, empty captions."""
+    images = sorted((f for f in os.listdir(folder)
+                     if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+                     and os.path.isfile(os.path.join(folder, f))), key=natural_key)
+    image_stems = {os.path.splitext(n)[0] for n in images}
+    txt_of = lambda n: os.path.join(folder, os.path.splitext(n)[0] + ".txt")
+    read = lambda n: open(txt_of(n), encoding="utf-8").read()
+    checks = []
+
+    # pairing
+    no_txt = sorted(n for n in images if not os.path.exists(txt_of(n)))
+    empty = sorted(n for n in images if os.path.exists(txt_of(n))
+                   and not read(n).strip())
+    orphan_txt = sorted(f for f in os.listdir(folder)
+                        if f.lower().endswith(".txt")
+                        and os.path.splitext(f)[0] not in image_stems)
+    if no_txt or empty or orphan_txt:
+        checks.append({"id": "pairing", "name": "image ↔ caption pairing",
+                       "status": "warn",
+                       "message": f"{len(no_txt)} uncaptioned · {len(empty)} empty · {len(orphan_txt)} orphan .txt",
+                       "items": (no_txt + ["(empty) " + e for e in empty]
+                                  + ["(orphan) " + o for o in orphan_txt])})
+    else:
+        checks.append({"id": "pairing", "name": "image ↔ caption pairing",
+                       "status": "ok",
+                       "message": f"all {len(images)} images have non-empty captions"})
+
+    # corrupt images
+    corrupt = []
+    for n in images:
+        try:
+            with Image.open(os.path.join(folder, n)) as im:
+                im.load()
+        except Exception:
+            corrupt.append(n)
+    checks.append({"id": "corrupt", "name": "image files decode",
+                   "status": "fail" if corrupt else "ok",
+                   "message": f"{len(corrupt)} corrupt" if corrupt else f"all {len(images)} decode cleanly",
+                   "items": corrupt})
+
+    # pixel dupes (hash of bytes)
+    hashes: dict[str, list[str]] = {}
+    for n in images:
+        with open(os.path.join(folder, n), "rb") as f:
+            h = hashlib.md5(f.read()).hexdigest()
+        hashes.setdefault(h, []).append(n)
+    dup_groups = [v for v in hashes.values() if len(v) > 1]
+    if dup_groups:
+        checks.append({"id": "dupes", "name": "duplicate images", "status": "warn",
+                       "message": f"{sum(len(v) for v in dup_groups)} images in {len(dup_groups)} duplicate group(s)",
+                       "items": ["identical: " + ", ".join(v) for v in dup_groups]})
+    else:
+        checks.append({"id": "dupes", "name": "duplicate images", "status": "ok",
+                       "message": "no exact duplicates"})
+
+    # trigger coverage (needs config)
+    cfg, _ = load_config(folder, None)
+    trigger = str(cfg.get("trigger", "")).strip()
+    if trigger:
+        missing = [n for n in images
+                   if not os.path.exists(txt_of(n)) or trigger not in read(n)]
+        ratio = 1 - len(missing) / max(len(images), 1)
+        checks.append({"id": "trigger", "name": f"trigger '{trigger}' in every caption",
+                       "status": "ok" if not missing else "warn",
+                       "message": f"{ratio:.0%} coverage" if not missing
+                                   else f"{len(missing)} captions missing the trigger ({ratio:.0%} coverage)",
+                       "items": missing})
+    else:
+        checks.append({"id": "trigger", "name": "trigger coverage", "status": "ok",
+                       "message": "no trigger in tagger.toml — skipped"})
+
+    # blacklist leakage (hint-precedence: hint tags are allowed to survive)
+    bl = [str(x) for x in cfg.get("blacklist", [])]
+    hint_set = {str(x).lower() for x in cfg.get("hint", [])}
+    if bl:
+        exact, prefixes, suffixes, contains = split_blacklist(", ".join(bl))
+        leaked: dict[str, list[str]] = {}
+        for n in images:
+            if os.path.exists(txt_of(n)):
+                for t in parse_tag_list(read(n)):
+                    if t in hint_set:
+                        continue
+                    if is_blacklisted(t, exact, prefixes, suffixes, contains):
+                        leaked.setdefault(n, []).append(t)
+        if leaked:
+            checks.append({"id": "leakage", "name": "blocklisted tags in captions",
+                           "status": "warn",
+                           "message": f"{sum(len(v) for v in leaked.values())} blocklisted tag(s) across {len(leaked)} captions",
+                           "items": [f"{n}: {', '.join(v)}" for n, v in sorted(leaked.items())]})
+        else:
+            checks.append({"id": "leakage", "name": "blocklisted tags in captions",
+                           "status": "ok", "message": "zero leakage"})
+    else:
+        checks.append({"id": "leakage", "name": "blocklist leakage", "status": "ok",
+                       "message": "no blacklist in tagger.toml — skipped"})
+
+    # duplicate tags inside one caption
+    dup_tagged: dict[str, list[str]] = {}
+    for n in images:
+        if os.path.exists(txt_of(n)):
+            seen: dict[str, int] = {}
+            for t in parse_tag_list(read(n)):
+                seen[t] = seen.get(t, 0) + 1
+            dup = sorted(t for t, c in seen.items() if c > 1)
+            if dup:
+                dup_tagged[n] = dup
+    if dup_tagged:
+        checks.append({"id": "dup_tags", "name": "duplicate tags inside a caption",
+                       "status": "warn",
+                       "message": f"{len(dup_tagged)} captions repeat tags",
+                       "items": [f"{n}: {', '.join(v)}" for n, v in sorted(dup_tagged.items())]})
+    else:
+        checks.append({"id": "dup_tags", "name": "duplicate tags inside a caption",
+                       "status": "ok", "message": "no repeats"})
+
+    return {"folder": folder, "images": len(images), "checks": checks}
+
+
+def split_preview(folder: str, percent: float, seed: int) -> dict:
+    """Deterministic seed shuffle → train/val assignment preview."""
+    images = sorted((f for f in os.listdir(folder)
+                     if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+                     and os.path.isfile(os.path.join(folder, f))), key=natural_key)
+    shuffled = images[:]
+    random.Random(seed).shuffle(shuffled)
+    n_val = max(1, round(len(images) * percent / 100)) if images else 0
+    val = set(shuffled[:n_val])
+    return {"images": [{"name": n, "set": "val" if n in val else "train"}
+                       for n in images],
+            "counts": {"train": len(images) - n_val, "val": n_val}}
+
+
+def split_apply(folder: str, assignment: dict, mode: str) -> dict:
+    """assignment: {image_name: 'train'|'val'}; mode: copy | manifest."""
+    if not assignment:
+        return {"ok": False, "error": "no images assigned"}
+    for sub in ("train", "val"):
+        if os.path.exists(os.path.join(folder, sub)):
+            return {"ok": False,
+                    "error": f"{sub}/ already exists in the dataset — delete or move it before re-splitting"}
+    sets = {"train": [], "val": []}
+    for n, s in assignment.items():
+        if s not in sets:
+            return {"ok": False, "error": f"bad set for {n}: {s!r}"}
+        sets[s].append(n)
+    if mode == "copy":
+        for sub, names in sets.items():
+            os.makedirs(os.path.join(folder, sub))
+            for n in names:
+                stem = os.path.splitext(n)[0]
+                shutil.copy2(os.path.join(folder, n), os.path.join(folder, sub, n))
+                txt = os.path.join(folder, stem + ".txt")
+                if os.path.exists(txt):
+                    shutil.copy2(txt, os.path.join(folder, sub, stem + ".txt"))
+    with open(os.path.join(folder, "split.json"), "w", encoding="utf-8") as f:
+        json.dump(sets, f, indent=1)
+    logger.info("split applied: %d train / %d val (%s mode)",
+                len(sets["train"]), len(sets["val"]), mode)
+    return {"ok": True, "mode": mode,
+            "counts": {"train": len(sets["train"]), "val": len(sets["val"])},
+            "dirs": ["train", "val"] if mode == "copy" else []}
+
+
+def detect_base_config(folder: str) -> str:
+    """Find a previous OneTrainer config to use as the export template."""
+    cand = os.path.join(folder, "onetrainer_config.json")
+    if os.path.isfile(cand):
+        return cand
+    for _ in range(3):
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        ws = os.path.join(parent, "OneTrainer_Workspace", "config")
+        if os.path.isdir(ws):
+            cfgs = sorted(os.path.join(ws, f) for f in os.listdir(ws)
+                          if f.endswith(".json"))
+            if cfgs:
+                return cfgs[-1]
+        folder = parent
+    return ""
+
+
+def one_trainer_concept(folder: str, name: str) -> dict:
+    """A STANDARD image+sample-text concept, matching OneTrainer's schema."""
+    return {
+        "__version": 2,
+        "image": {"__version": 0, "enable_crop_jitter": False, "enable_random_flip": False,
+                  "enable_fixed_flip": False, "enable_random_rotate": False,
+                  "enable_fixed_rotate": False, "random_rotate_max_angle": 0.0,
+                  "enable_random_brightness": False, "enable_fixed_brightness": False,
+                  "random_brightness_max_strength": 0.0, "enable_random_contrast": False,
+                  "enable_fixed_contrast": False, "random_contrast_max_strength": 0.0,
+                  "enable_random_saturation": False, "enable_fixed_saturation": False,
+                  "random_saturation_max_strength": 0.0, "enable_random_hue": False,
+                  "enable_fixed_hue": False, "random_hue_max_strength": 0.0,
+                  "enable_resolution_override": False, "resolution_override": "512",
+                  "enable_random_circular_mask_shrink": False,
+                  "enable_random_mask_rotate_crop": False},
+        "text": {"__version": 0, "prompt_source": "sample", "prompt_path": "",
+                  "enable_tag_shuffling": False, "tag_delimiter": ",", "keep_tags_count": 1,
+                  "tag_dropout_enable": False, "tag_dropout_mode": "FULL",
+                  "tag_dropout_probability": 0.0, "tag_dropout_special_tags_mode": "NONE",
+                  "tag_dropout_special_tags": "", "tag_dropout_special_tags_regex": False,
+                  "caps_randomize_enable": False,
+                  "caps_randomize_mode": "capslock, title, first, random",
+                  "caps_randomize_probability": 0.0, "caps_randomize_lowercase": False},
+        "name": name, "path": folder,
+        "seed": random.randrange(-2 ** 31, 2 ** 31), "enabled": True,
+        "type": "STANDARD", "include_subdirectories": False,
+        "image_variations": 1, "text_variations": 1,
+        "balancing": 1.0, "balancing_strategy": "REPEATS", "loss_weight": 1.0,
+    }
+
+
+ONETRAINER_SKELETON = {
+    "__version": 0,
+    "training_method": "LORA",
+    "model_type": "STABLE_DIFFUSION_XL_10_BASE",
+    "base_model_name": "",
+    "output_dtype": "FLOAT32",
+    "output_model_format": "SAFETENSORS",
+    "output_model_destination": "",
+    "gradient_checkpointing": False,
+    "compile": False,
+    "aspect_ratio_bucketing": True,
+    "latent_caching": True,
+    "learning_rate_scheduler": "constant",
+    "learning_rate": 5e-05,
+    "learning_rate_warmup_steps": 0,
+    "epochs": 200,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "ema": True,
+    "train_device": "cuda",
+    "resolution": 1024,
+    "dropout_probability": 0.0,
+    "optimizer": {"optimizer": "ADAMW", "eps": 1e-08, "beta1": 0.9,
+                   "beta2": 0.999, "weight_decay": 0.01},
+    "lora_model_name": "",
+    "lora_rank": 16,
+    "lora_alpha": 8.0,
+    "lora_weight_dtype": "FLOAT32",
+    "sample_after": 10,
+    "sample_after_unit": "EPOCH",
+    "save_every": 20,
+    "save_every_unit": "EPOCH",
+    "save_skip_first": True,
+    "save_filename_prefix": "",
+    "concept_file_name": "training_concepts/concepts.json",
+    "concepts": [],
+    "validation": {},
+    "samples": [],
+    "tensorboard": True,
+    "continue_last_backup": False,
+    "include_train_config": False,
+    "workspace_dir": "",
+    "cache_dir": "",
+    "backup_after": 10,
+    "backup_after_unit": "EPOCH",
+    "rolling_backup": False,
+    "backup_before_save": False,
+}
+
+
+def export_config(folder: str, params: dict) -> dict:
+    """Build a OneTrainer config: last config as template (or skeleton), patched
+    with dataset-specific fields. Writes onetrainer_config.json into the folder."""
+    trigger = str(params.get("trigger", "")).strip() or os.path.basename(folder)
+    base = str(params.get("base_config", "")).strip()
+    cfg = None
+    if base and os.path.isfile(base):
+        try:
+            with open(base, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = None
+    cfg = {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+           for k, v in (cfg or ONETRAINER_SKELETON).items()}
+    concept_path = folder
+    if params.get("use_split") and os.path.isdir(os.path.join(folder, "train")):
+        concept_path = os.path.join(folder, "train")
+    cfg["concepts"] = [one_trainer_concept(concept_path, trigger)]
+    cur = cfg.get
+    cfg["epochs"] = int(params.get("epochs") or cur("epochs", 200))
+    cfg["learning_rate"] = float(params.get("lr") or cur("learning_rate", 5e-05))
+    cfg["lora_rank"] = int(params.get("rank") or cur("lora_rank", 16))
+    cfg["lora_alpha"] = float(params.get("alpha") or cur("lora_alpha", 8.0))
+    cfg["resolution"] = int(params.get("resolution") or cur("resolution", 1024))
+    save_dir = str(params.get("save_dir") or "").strip()
+    if not save_dir:
+        old = cfg.get("output_model_destination") or ""
+        save_dir = os.path.dirname(old) if old else folder
+    cfg["output_model_destination"] = os.path.join(save_dir, f"{trigger}-lora.safetensors")
+    out = os.path.join(folder, "onetrainer_config.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    logger.info("exported OneTrainer config: %s", out)
+    return {"ok": True, "path": out, "config": cfg}
 
 
 def build_review_data(folder: str) -> dict:
@@ -1303,6 +1943,43 @@ def make_app_handler(folder: str):
                     "text/html; charset=utf-8")
             if parsed.path == "/api/setup-config":
                 return self._json(setup_payload(folder))
+            if parsed.path == "/validate":
+                return self._respond(
+                    VALIDATE_HTML.replace("{{FOLDER}}", folder).encode("utf-8"),
+                    "text/html; charset=utf-8")
+            if parsed.path == "/api/validate":
+                return self._json(validate_folder(folder))
+            if parsed.path == "/split":
+                return self._respond(
+                    SPLIT_HTML.replace("{{FOLDER}}", folder).encode("utf-8"),
+                    "text/html; charset=utf-8")
+            if parsed.path == "/api/split-preview":
+                qs = urllib.parse.parse_qs(parsed.query)
+                try:
+                    percent = float(qs.get("percent", ["10"])[0])
+                    seed = int(qs.get("seed", ["42"])[0])
+                except ValueError:
+                    return self._json({"ok": False, "error": "bad percent/seed"}, 400)
+                return self._json(split_preview(folder, percent, seed))
+            if parsed.path == "/export":
+                return self._respond(
+                    EXPORT_HTML.replace("{{FOLDER}}", folder).encode("utf-8"),
+                    "text/html; charset=utf-8")
+            if parsed.path == "/api/export-hints":
+                base = detect_base_config(folder)
+                save_dir = ""
+                if base:
+                    try:
+                        with open(base, encoding="utf-8") as f:
+                            d = json.load(f)
+                        save_dir = os.path.dirname(d.get("output_model_destination") or "")
+                    except Exception:
+                        pass
+                cfg, _ = load_config(folder, None)
+                return self._json({"base_config": base,
+                                   "trigger": cfg.get("trigger", ""),
+                                   "save_dir": save_dir,
+                                   "has_split": os.path.isdir(os.path.join(folder, "train"))})
             if parsed.path.startswith("/img/"):
                 name = os.path.basename(
                     urllib.parse.unquote(parsed.path[len("/img/"):]))
@@ -1346,6 +2023,11 @@ def make_app_handler(folder: str):
                 return self._json({"ok": True, "name": name})
             if path == "/api/setup-save":
                 return self._json(setup_save(folder, body))
+            if path == "/api/split-apply":
+                return self._json(split_apply(folder, body.get("assignment") or {},
+                                              str(body.get("mode", "copy"))))
+            if path == "/api/export-config":
+                return self._json(export_config(folder, body))
             self.send_error(404)
 
         def log_message(self, fmt, *args):
@@ -1359,8 +2041,12 @@ def serve_app(folder: str, port: int, page: str, open_browser: bool):
     if not any(os.path.splitext(f)[1].lower() in IMAGE_EXTS
                for f in os.listdir(folder)):
         sys.exit(f"no images ({', '.join(sorted(IMAGE_EXTS))}) found in {folder}")
-    url = f"http://127.0.0.1:{port}{'/setup' if page == 'setup' else ''}"
-    print(f"tagger {'setup wizard' if page == 'setup' else 'review grid'}: {url}  (Ctrl+C to stop)")
+    path = {"review": "/", "setup": "/setup", "validate": "/validate",
+            "split": "/split", "export": "/export"}.get(page, "/")
+    url = f"http://127.0.0.1:{port}{path}"
+    label = {"review": "review grid", "setup": "setup wizard",
+             "validate": "validate", "split": "split", "export": "export"}.get(page, page)
+    print(f"tagdeck {label}: {url}  (Ctrl+C to stop)")
     if open_browser:
         try:
             webbrowser.open(url)
@@ -1502,6 +2188,10 @@ def main(argv=None):
 
     if args.setup:
         serve_app(args.folder, args.port, "setup", not args.no_browser)
+        return
+
+    if args.ui:
+        serve_app(args.folder, args.port, args.ui, not args.no_browser)
         return
 
     try:
