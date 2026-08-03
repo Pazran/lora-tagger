@@ -1371,6 +1371,7 @@ EXPORT_HTML = r"""<!doctype html>
   .field input[type=number] { width:140px; }
   .pathentry { display:flex; gap:8px; }
   .pathentry input { flex:1; }
+  .note { font-size:12px; color:#999; margin-top:10px; }
   .modal { position:fixed; inset:0; background:rgba(0,0,0,.65); align-items:center; justify-content:center; z-index:50; }
   .modal-box { background:#1b1b1b; border:1px solid #3a3a3a; border-radius:10px; width:600px; max-width:94vw; max-height:80vh; display:flex; flex-direction:column; overflow:hidden; }
   .modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid #2c2c2c; font-size:12px; color:#999; }
@@ -1418,6 +1419,7 @@ EXPORT_HTML = r"""<!doctype html>
       <div class="field"><label>lora rank</label><input id="rank" type="number" value=""></div>
       <div class="field"><label>lora alpha</label><input id="alpha" type="number" step="0.5" value=""></div>
     </div>
+    <div class="note" id="epochNote"></div>
     <label class="check"><input id="useSplit" type="checkbox"> point the concept at train/ (use the split)</label>
     <div style="margin-top:12px"><button class="btn primary" onclick="generate()">generate + save</button></div>
   </section>
@@ -1446,6 +1448,17 @@ async function init() {
   byId('trigger').value = h.trigger || '';
   byId('saveDir').value = h.save_dir || '';
   byId('useSplit').checked = !!h.has_split;
+  if (h.image_count) {
+    byId('epochs').value = h.epochs || '';
+    byId('resolution').value = h.resolution || 1024;
+    byId('lr').value = (h.lr !== '' && h.lr != null) ? h.lr : '';
+    byId('rank').value = h.rank || '';
+    byId('alpha').value = h.alpha || '';
+    const steps = h.image_count * (h.epochs || 0);
+    byId('epochNote').textContent = h.image_count + ' images x ' + (h.epochs || 0) +
+      ' epochs @ 1 repeat = ' + steps.toLocaleString() + ' total steps (~100 steps/image) — ' +
+      'lr/rank/alpha/res from your last config, epochs recomputed';
+  }
 }
 
 function num(id) {
@@ -1508,6 +1521,14 @@ async function browseGo(p) {
   byId('bselect').style.display = browser.mode === 'dir' ? 'inline-block' : 'none';
   const ul = byId('blist');
   ul.innerHTML = '';
+  if (!d.parent) {
+    for (const dr of (d.drives || [])) {
+      const li = document.createElement('li');
+      li.className = 'dir'; li.textContent = '💽 ' + dr.name;
+      li.onclick = () => browseGo(dr.path);
+      ul.appendChild(li);
+    }
+  }
   if (!d.dirs.length && !d.files.length) {
     const li = document.createElement('li');
     li.className = 'placeholder'; li.textContent = '(empty)'; ul.appendChild(li);
@@ -1893,6 +1914,15 @@ ONETRAINER_SKELETON = {
 }
 
 
+def list_drives() -> list:
+    """Available drive letters on Windows (empty elsewhere)."""
+    if os.name != "nt":
+        return []
+    import string
+    return [{"name": f"{d}:\\", "path": f"{d}:\\"}
+            for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+
+
 def browse(path: str = "", ext: str = "") -> dict:
     """List a directory for the export page's folder browser (read-only).
 
@@ -1919,6 +1949,7 @@ def browse(path: str = "", ext: str = "") -> dict:
     parent = os.path.dirname(path)
     return {"ok": True, "path": path,
             "parent": parent if parent != path else None,
+            "drives": list_drives(),
             "dirs": dirs, "files": files}
 
 
@@ -2070,18 +2101,38 @@ def make_app_handler(folder: str):
             if parsed.path == "/api/export-hints":
                 base = detect_base_config(folder)
                 save_dir = ""
+                base_cfg = {}
                 if base:
                     try:
                         with open(base, encoding="utf-8") as f:
-                            d = json.load(f)
-                        save_dir = os.path.dirname(d.get("output_model_destination") or "")
+                            base_cfg = json.load(f)
+                        save_dir = os.path.dirname(base_cfg.get("output_model_destination") or "")
                     except Exception:
-                        pass
+                        base_cfg = {}
                 cfg, _ = load_config(folder, None)
+                has_split = os.path.isdir(os.path.join(folder, "train"))
+                concept_dir = os.path.join(folder, "train") if has_split else folder
+                n = 0
+                if os.path.isdir(concept_dir):
+                    n = len([f for f in os.listdir(concept_dir)
+                             if f.lower().endswith(tuple(IMAGE_EXTS))])
+                # ~100 steps per image, no repeats -> epochs = 100 * n / (n * 1)
+                optimal = max(1, round(100 * n / max(n, 1))) if n else ""
+                try:
+                    res = int(base_cfg.get("resolution") or 1024)
+                except (TypeError, ValueError):
+                    res = 1024
                 return self._json({"base_config": base,
                                    "trigger": cfg.get("trigger", ""),
                                    "save_dir": save_dir,
-                                   "has_split": os.path.isdir(os.path.join(folder, "train"))})
+                                   "has_split": has_split,
+                                   "image_count": n,
+                                   "epochs": optimal,
+                                   "lr": base_cfg.get("learning_rate") or "",
+                                   "rank": base_cfg.get("lora_rank") or "",
+                                   "alpha": base_cfg.get("lora_alpha") or "",
+                                   "resolution": res,
+                                   "last_epochs": base_cfg.get("epochs") or ""})
             if parsed.path == "/api/browse":
                 qs = urllib.parse.parse_qs(parsed.query)
                 return self._json(browse(qs.get("path", [""])[0],
