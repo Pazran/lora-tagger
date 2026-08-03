@@ -133,6 +133,29 @@ tagger . --review            # opens http://127.0.0.1:8765
 
 `--audit` remains for headless checks; `--review` is the interactive version.
 
+## Setup wizard (`--setup`)
+
+The config black-art, retired. Instead of hand-writing `tagger.toml` (or
+memorising the long CLI command), answer eight plain-word questions in the
+browser and it writes the config for you:
+
+```bash
+tagger . --setup
+```
+
+- **Plain words in, wildcards out** — type *"armor, dress, gown, scale, chain"*
+  and it generates `*armor*, *dress*, ...` with a live preview showing exactly
+  which of your current caption tags each word blocks.
+- **School picker** — the two schools explained side by side; flipping flips
+  your lists too (subject details move hint ↔ blocklist, with a note saying
+  what moved).
+- **Re-opening an existing config** — it infers the school from your blocklist,
+  recovers the subject words, separates out meta junk, and never loses your
+  tuning values (temperature, workers, ...).
+- **Trigger validation** — lowercase snake_case enforced before save.
+
+`--init-config` remains for headless scaffold; `--setup` is the interactive way.
+
 ## Full pipeline (compose with renamer)
 
 ```bash
@@ -192,6 +215,7 @@ Built-in prompt rules apply to every dataset:
 | `--dry-run` | off | print captions, write nothing (no confirmation needed) |
 | `--audit` | off | print tag-frequency report over existing captions (no API) |
 | `--review` | off | human review grid in the browser (no API) |
+| `--setup` | off | config wizard in the browser — plain-word questions that generate `tagger.toml` (no API) |
 | `--port` | `8765` | port for `--review` |
 | `--no-browser` | off | with `--review`: don't auto-open the browser |
 | `--report` | off | print tag-frequency report after tagging |
