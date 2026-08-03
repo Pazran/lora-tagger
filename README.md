@@ -99,6 +99,7 @@ always survive the blacklist in either school.
 ```bash
 # from any directory (D:/Scripts must be on PATH)
 tagger D:\dataset                       # tag all images, skip non-empty captions
+tagger . --init-config                  # commented starter tagger.toml, then edit by hand
 tagger . --dry-run --force --limit 5    # preview 5 images, write nothing
 tagger . --subject outfit --trigger myoutfit
 tagger . --character "1girl, elf, silver_hair" --trigger mychar
@@ -162,11 +163,12 @@ Built-in prompt rules apply to every dataset:
 | `--workers` | `1` | parallel requests (LM Studio queues; keep low) |
 | `--batch-size` | `1` | N images per API call → consistent vocabulary across similar images |
 | `--limit` | all | process at most N images |
-| `--force` | off | re-tag non-empty captions |
-| `--dry-run` | off | print captions, write nothing |
+| `--force` | off | re-tag non-empty captions; **asks for confirmation** before overwriting |
+| `--dry-run` | off | print captions, write nothing (no confirmation needed) |
 | `--audit` | off | print tag-frequency report over existing captions (no API) |
 | `--report` | off | print tag-frequency report after tagging |
 | `--save-config` | off | write `tagger.toml` into the dataset folder and exit |
+| `--init-config` | off | write a commented starter `tagger.toml` (refuses to overwrite) and exit |
 | `--config` | auto | explicit config path instead of auto-loading `tagger.toml` |
 
 ## Troubleshooting

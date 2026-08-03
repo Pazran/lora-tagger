@@ -27,6 +27,7 @@ DEFAULT_BASE_URL = "http://localhost:1234/v1"
 
 CYAN = "\033[36m"
 RED = "\033[31m"
+YELLOW = "\033[33m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 
@@ -142,7 +143,8 @@ def parse_args(argv):
                "  tagger . --character \"1girl, elf, silver_hair\" --trigger mychar\n"
                "  tagger . --subject style --trigger mystyle\n"
                "  tagger . --hint \"face_paint\" --blacklist \"fantasy_*, ornate\"\n"
-               "  tagger . --save-config                   # persist settings to tagger.toml",
+               "  tagger . --save-config                   # persist settings to tagger.toml\n"
+               "  tagger . --init-config                   # write a commented starter tagger.toml",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("folder", nargs="?", default=".",
@@ -152,6 +154,9 @@ def parse_args(argv):
                         "in the target folder is auto-loaded")
     p.add_argument("--save-config", action="store_true",
                    help="write effective settings to tagger.toml in the folder and exit")
+    p.add_argument("--init-config", action="store_true",
+                   help="write a commented starter tagger.toml into the folder (refuses to "
+                        "overwrite an existing one) and exit")
     p.add_argument("--subject", choices=("character", "outfit", "style"), default=None,
                    help="what the model should focus on (default: character)")
     p.add_argument("--trigger", default=None,
@@ -398,6 +403,45 @@ def save_config(args):
     print(f"config saved to {path}")
 
 
+SCAFFOLD_CONFIG = """\
+# tagger.toml - dataset config (auto-loaded when you run `tagger .` here)
+#
+# Pick a school first (see README "Two schools"):
+#   School 2 (recommended for identity/subject LoRAs): the TRIGGER owns the
+#     subject. character = invariants only (e.g. 1girl); blacklist = the whole
+#     subject vocabulary (*armor*, *scale*, *chain*, ...) so nothing but the
+#     trigger describes it. Captions become short; max fidelity.
+#   School 1 (decomposable/controllable): TAG the subject's features so you can
+#     prompt them later. hint = canonical words, blacklist = synonyms only.
+#     Human-verify the per-image tags (run `tagger . --audit`).
+subject = "character"        # character | outfit | style
+character = ["1girl"]        # invariant header: true on EVERY image
+hint = []                    # canonical tags: use exactly these when visible
+blacklist = []               # strip: 'foo' exact, 'foo*' prefix, '*foo' suffix, '*foo*' any
+
+# optional: trigger = "mychar"     # token prepended to every caption
+# optional: model = "qwen3-vl-8b-instruct"
+
+temperature = 0.3
+max_tags = 40
+max_size = 1280
+workers = 1
+base_url = "http://localhost:1234/v1"
+"""
+
+
+def init_config(folder: str):
+    """Write a commented starter tagger.toml; refuse to clobber an existing one."""
+    path = os.path.join(folder, "tagger.toml")
+    if os.path.exists(path):
+        sys.exit(f"error: {path} already exists - edit it instead of re-initializing")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(SCAFFOLD_CONFIG)
+    print(f"starter config written to {path}")
+    print("edit it by hand, or override with CLI flags and run `tagger . --save-config`")
+    print("to persist the effective settings.")
+
+
 def print_tag_report(caption_counts: dict[str, int], total_images: int):
     """Print tag frequency over the final captions (what the trainer sees).
 
@@ -549,6 +593,10 @@ def main(argv=None):
         logger.info("loaded config: %s", cfg_path)
     resolve_args(args, cfg)
 
+    if args.init_config:
+        init_config(args.folder)
+        return
+
     if args.save_config:
         save_config(args)
         return
@@ -580,13 +628,16 @@ def main(argv=None):
     hint = set(parse_tag_list(args.hint))
 
     jobs, skipped = [], 0
+    existing_caption = set()
     for img in images:
         stem = os.path.splitext(img)[0]
         txt = os.path.join(args.folder, stem + ".txt")
-        if (os.path.exists(txt) and open(txt, encoding="utf-8").read().strip()
-                and not args.force):
-            skipped += 1
-            continue
+        has_caption = os.path.exists(txt) and open(txt, encoding="utf-8").read().strip()
+        if has_caption:
+            existing_caption.add(img)
+            if not args.force:
+                skipped += 1
+                continue
         jobs.append(img)
 
     if args.limit:
@@ -596,6 +647,20 @@ def main(argv=None):
     if total == 0:
         print(f"nothing to tag ({skipped} already captioned)")
         return
+
+    overwritten = sum(1 for img in jobs if img in existing_caption)
+    if args.force and overwritten and not args.dry_run:
+        print(f"{color('WARNING:', YELLOW)} --force will re-tag {total} image(s), "
+              f"overwriting {overwritten} existing caption(s) "
+              f"(hand-edited captions included).")
+        try:
+            answer = input("continue? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("aborted - no files touched")
+            return
+
 
     print(f"tagging {total} image(s) with {model}"
           + ("  [dry-run: nothing will be written]" if args.dry_run else ""))
