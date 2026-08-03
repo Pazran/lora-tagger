@@ -149,7 +149,8 @@ def parse_args(argv):
                "  tagger . --hint \"face_paint\" --blacklist \"fantasy_*, ornate\"\n"
                "  tagger . --save-config                   # persist settings to tagger.toml\n"
                "  tagger . --init-config                   # write a commented starter tagger.toml\n"
-               "  tagger . --review                        # human review grid in the browser",
+               "  tagger . --review                        # human review grid in the browser\n"
+               "  tagger . --setup                         # config wizard in the browser",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("folder", nargs="?", default=".",
@@ -208,6 +209,9 @@ def parse_args(argv):
                    help="open the human review grid in the browser: thumbnails + click-to-edit "
                         "captions, singleton/empty/missing flags; saves straight back to .txt "
                         "(no LM Studio needed)")
+    p.add_argument("--setup", action="store_true",
+                   help="open the config wizard in the browser: plain-word questions that "
+                        "generate tagger.toml (no LM Studio needed)")
     p.add_argument("--port", type=int, default=8765,
                    help="port for the --review web UI (default: 8765)")
     p.add_argument("--no-browser", action="store_true",
@@ -519,6 +523,7 @@ REVIEW_HTML = """<!doctype html>
   .chip.on { background:#5a1f1f; border-color:#ff8787; }
   .chip.single { color:#ff8787; }
   select, .btn { background:#2a2a2a; color:#ddd; border:1px solid #3a3a3a; border-radius:6px; padding:4px 10px; font-size:13px; cursor:pointer; }
+  a.btn { text-decoration:none; display:inline-block; }
   .btn:hover { background:#333; }
   .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:14px; padding:16px; }
   .card { background:#1b1b1b; border:1px solid #2c2c2c; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }
@@ -550,6 +555,7 @@ REVIEW_HTML = """<!doctype html>
       <option value="ok">captioned only</option>
       <option value="empty">empty / missing</option>
     </select>
+    <a class="btn" href="/setup">⚙ setup wizard</a>
     <button class="btn" onclick="load()">↻ refresh flags</button>
     <span style="font-size:12px;color:#666" id="shown"></span>
   </div>
@@ -685,6 +691,531 @@ load();
 </html>"""
 
 
+SETUP_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tagger setup — {{FOLDER}}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#141414; color:#ddd; padding-bottom:40px; }
+  header { position:sticky; top:0; z-index:10; background:#1b1b1b; border-bottom:1px solid #2c2c2c; padding:10px 16px; }
+  h1 { font-size:15px; margin:0; color:#fff; font-weight:600; }
+  h1 small { color:#888; font-weight:400; }
+  .nav { margin-top:6px; display:flex; gap:10px; font-size:13px; }
+  .nav a { color:#69db7c; text-decoration:none; }
+  .wrap { max-width:880px; margin:0 auto; padding:20px 16px; }
+  section { background:#1b1b1b; border:1px solid #2c2c2c; border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  section h2 { font-size:13px; margin:0 0 4px; color:#fff; text-transform:uppercase; letter-spacing:.5px; }
+  .desc { font-size:12.5px; color:#999; margin:0 0 10px; line-height:1.5; }
+  code { background:#222; padding:1px 4px; border-radius:4px; font-size:11px; color:#9ecbff; }
+  .radio-row { display:flex; gap:10px; flex-wrap:wrap; }
+  .card { flex:1; min-width:230px; border:1px solid #3a3a3a; border-radius:8px; padding:10px 12px; cursor:pointer; background:#222; }
+  .card:hover { border-color:#555; }
+  .card.on { border-color:#69db7c; background:#1d2b1d; }
+  .card h3 { margin:0 0 4px; font-size:13px; color:#fff; }
+  .card p { margin:0; font-size:12px; color:#aaa; line-height:1.45; }
+  .tag { font-size:10px; color:#ffd43b; background:#5a4a1f; border-radius:8px; padding:1px 7px; margin-left:6px; }
+  .trigger-wrap { display:flex; gap:8px; align-items:center; max-width:520px; }
+  .trigger-wrap input { font-family:ui-monospace,monospace; flex:1; }
+  input[type=text] { width:100%; background:#131313; color:#ddd; border:1px solid #444; border-radius:6px; padding:8px 10px; font-size:13px; }
+  .warn { font-size:12px; color:#ff8787; margin-top:6px; }
+  .ok { font-size:12px; color:#69db7c; margin-top:6px; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; padding:8px 0 0; }
+  .chip { background:#2a2a2a; border:1px solid #3a3a3a; border-radius:12px; padding:2px 6px 2px 10px; font-size:12px; display:inline-flex; align-items:center; gap:6px; }
+  .chip button { background:none; border:none; color:#999; cursor:pointer; font-size:13px; padding:0; line-height:1; }
+  .chip button:hover { color:#ff8787; }
+  .chip.gen { border-color:#4a5a4a; color:#9ef0a9; }
+  .chip.junk { border-style:dashed; color:#ccc; }
+  .add-row { display:flex; gap:8px; margin-top:10px; }
+  .add-row input { flex:1; }
+  .btn { background:#2a2a2a; color:#ddd; border:1px solid #3a3a3a; border-radius:6px; padding:6px 14px; font-size:13px; cursor:pointer; }
+  .btn:hover { background:#333; }
+  .btn.primary { background:#2b4a2b; border-color:#69db7c; color:#c8f7c8; }
+  .btn.primary:hover { background:#345c34; }
+  .preview { background:#131313; border:1px solid #333; border-radius:8px; padding:10px 12px; margin-top:12px; }
+  .pv-line { font-size:12px; font-family:ui-monospace,monospace; color:#ccc; margin:3px 0; }
+  .pv-line .n { color:#69db7c; }
+  .pv-line .none { color:#ff8787; }
+  .sec { font-size:11px; color:#777; text-transform:uppercase; letter-spacing:.5px; margin:12px 0 0; }
+  pre.toml { background:#0d0d0d; border:1px solid #333; border-radius:8px; padding:12px; font:12px/1.6 ui-monospace,monospace; color:#9ecbff; overflow-x:auto; margin:0; }
+  .saved { color:#69db7c; font-size:13px; }
+  .saved a { color:#69db7c; }
+  .note { background:#2a2410; border:1px solid #5a4a1f; color:#ffd43b; font-size:12.5px; border-radius:8px; padding:8px 12px; margin-top:8px; display:none; }
+  .stepnum { display:inline-block; width:18px; height:18px; line-height:18px; text-align:center; background:#2a2a2a; color:#fff; border-radius:50%; font-size:11px; margin-right:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tagger setup <small>— {{FOLDER}}</small></h1>
+  <div class="nav"><a href="/">← review grid</a></div>
+</header>
+<div class="wrap">
+
+<section>
+  <h2><span class="stepnum">1</span>What are we training?</h2>
+  <div class="radio-row" id="subjectRow"></div>
+</section>
+
+<section>
+  <h2><span class="stepnum">2</span>Trigger word</h2>
+  <div class="desc">The word that summons the subject when prompting. Lowercase, no spaces.</div>
+  <div class="trigger-wrap"><input type="text" id="trigger" placeholder="e.g. bg3_wavemother_robe"></div>
+  <div id="triggerMsg"></div>
+</section>
+
+<section>
+  <h2><span class="stepnum">3</span>School</h2>
+  <div class="desc">How much the tags may say about the subject's look.</div>
+  <div class="radio-row" id="schoolRow"></div>
+  <div class="note" id="flipNote"></div>
+</section>
+
+<section>
+  <h2><span class="stepnum">4</span>True on every image <small style="color:#888">(header)</small></h2>
+  <div class="desc">Invariant tags — put in the caption of every image. For identity LoRAs: only non-subject invariants (e.g. <code>1girl</code>).</div>
+  <div class="chips" id="characterChips"></div>
+  <div class="add-row"><input type="text" id="characterInput" placeholder="type a tag, Enter to add"><button class="btn" id="characterAdd">+</button></div>
+</section>
+
+<section>
+  <h2><span class="stepnum">5</span>Varies per image, keep taggable <small style="color:#888">(hint)</small></h2>
+  <div class="desc" id="hintDesc"></div>
+  <div class="chips" id="hintChips"></div>
+  <div class="add-row"><input type="text" id="hintInput" placeholder="type a tag, Enter to add"><button class="btn" id="hintAdd">+</button></div>
+</section>
+
+<section>
+  <h2><span class="stepnum">6</span>Describe the subject's look <small style="color:#888">(generates the blocklist)</small></h2>
+  <div class="desc" id="wordsDesc"></div>
+  <div class="add-row"><input type="text" id="wordsInput" placeholder="e.g. armor, dress, gown, cape, scale, chain, sword, jewelry"><button class="btn" id="wordsAdd">generate</button></div>
+  <div class="chips" id="wordsChips"></div>
+  <div class="preview" id="wordsPreview"></div>
+  <div class="sec">→ blocklist entries (generated + editable)</div>
+  <div class="chips" id="blacklistChips"></div>
+</section>
+
+<section>
+  <h2><span class="stepnum">7</span>Danbooru meta junk</h2>
+  <div class="desc">Never useful for training (watermark, censored, translated…).</div>
+  <label style="font-size:13px"><input type="checkbox" id="junkOn" checked> block meta junk</label>
+  <div class="chips" id="junkChips"></div>
+</section>
+
+<section>
+  <h2><span class="stepnum">8</span>Preview &amp; save</h2>
+  <div class="desc">Written to <code>tagger.toml</code> in the dataset folder. Tuning values (temperature, workers, …) are kept if the config already exists.</div>
+  <pre class="toml" id="tomlPreview"></pre>
+  <div style="display:flex; gap:10px; align-items:center; margin-top:10px">
+    <button class="btn primary" id="saveBtn">save tagger.toml</button>
+    <span class="saved" id="savedMsg"></span>
+  </div>
+</section>
+
+</div>
+<script>
+"use strict";
+const byId = id => document.getElementById(id);
+
+const SUBJECTS = [
+  { id: 'character', name: 'character', desc: 'a person/character whose look is the subject' },
+  { id: 'outfit', name: 'outfit', desc: 'a specific outfit/costume on a person' },
+  { id: 'style', name: 'style', desc: 'an art style or texture — usually School 1' },
+];
+const SCHOOLS = [
+  { id: 1, name: 'School 1 — tag the subject', rec: false, desc: 'The model names every detail (blue_armor, scale_mail…). You prompt trigger + details. Risk: details can summon the subject without the trigger (leakage).' },
+  { id: 2, name: 'School 2 — the trigger owns it', rec: true, desc: 'Every subject detail is blocked; only the trigger names it. Prompting the trigger alone reproduces the subject. Recommended.' },
+];
+const COLOR_WORDS = ['blue','red','green','purple','pink','orange','yellow','black','white','brown','gray','grey','gold','silver','teal','turquoise','cyan','magenta','maroon','violet','indigo','beige','cream','crimson','scarlet','azure','bronze','copper','gilded'];
+const MATERIAL_WORDS = ['armor','armour','leather','cloth','fabric','cotton','silk','wool','fur','metal','steel','iron','chain','mail','scale','plate','dress','gown','robe','cape','cloak','skirt','boot','glove','jewel','gem','sword','blade','helmet','crown'];
+
+const state = {
+  subject: 'character', trigger: '', school: 2,
+  character: [], hint: [], blacklist: [], words: [],
+  junkOn: true, junk: [], captionTags: {}, cfg: {}, datasetName: '',
+};
+
+function isLookish(t) {
+  const low = t.toLowerCase();
+  return COLOR_WORDS.some(w => low.includes(w)) || MATERIAL_WORDS.some(w => low.includes(w));
+}
+function isSubjectish(t) {
+  const low = t.toLowerCase();
+  return isLookish(low) || state.words.some(w => low.includes(w));
+}
+function wildcardize(word) {
+  const w = word.trim().toLowerCase().replace(/[^a-z0-9_ ]/g, '').replace(/\s+/g, '_');
+  if (!w) return [];
+  const stems = new Set([w]);
+  if (w.endsWith('s') && !w.endsWith('ss') && !w.endsWith('es') && w.length > 4) stems.add(w.slice(0, -1));
+  return [...stems].sort().map(s => s.length <= 3 ? s : '*' + s + '*');
+}
+
+function bindChips(chipsEl, arr, cls, onRemove, onchange) {
+  function render() {
+    chipsEl.innerHTML = '';
+    for (const c of arr) {
+      const span = document.createElement('span');
+      span.className = 'chip' + (cls ? ' ' + cls : '');
+      span.textContent = c;
+      const x = document.createElement('button');
+      x.textContent = '✕';
+      x.onclick = () => {
+        const i = arr.indexOf(c);
+        if (i >= 0) arr.splice(i, 1);
+        if (onRemove) onRemove(c);
+        render(); onchange();
+      };
+      span.appendChild(x);
+      chipsEl.appendChild(span);
+    }
+  }
+  render();
+  return render;
+}
+function addChip(arr, input) {
+  const v = input.value.trim().toLowerCase().replace(/\s+/g, '_');
+  if (v && !arr.includes(v)) arr.push(v);
+  input.value = '';
+}
+function bindInput(inputEl, btnEl, arr, render) {
+  const add = () => { addChip(arr, inputEl); render(); onAnyChange(); };
+  btnEl.onclick = add;
+  inputEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); add(); }
+    else if (e.key === ',' && inputEl.value.trim()) { e.preventDefault(); add(); }
+  });
+}
+
+function renderSubject() {
+  const row = byId('subjectRow');
+  row.innerHTML = '';
+  for (const s of SUBJECTS) {
+    const c = document.createElement('div');
+    c.className = 'card' + (state.subject === s.id ? ' on' : '');
+    c.onclick = () => {
+      state.subject = s.id;
+      if (s.id === 'style' && state.school === 2) { state.school = 1; flipNote('style datasets are usually School 1 — flipped'); }
+      renderSubject(); renderSchool(); onAnyChange();
+    };
+    c.innerHTML = '<h3>' + s.name + '</h3><p>' + s.desc + '</p>';
+    row.appendChild(c);
+  }
+}
+
+function flipNote(text) {
+  const n = byId('flipNote');
+  n.textContent = text;
+  n.style.display = text ? 'block' : 'none';
+}
+function renderSchool() {
+  const row = byId('schoolRow');
+  row.innerHTML = '';
+  for (const s of SCHOOLS) {
+    const c = document.createElement('div');
+    c.className = 'card' + (state.school === s.id ? ' on' : '');
+    c.onclick = () => flipSchool(s.id);
+    c.innerHTML = '<h3>' + s.name + (s.rec ? '<span class="tag">recommended</span>' : '') + '</h3><p>' + s.desc + '</p>';
+    row.appendChild(c);
+  }
+}
+function flipSchool(newSchool) {
+  if (newSchool === state.school) return;
+  const moved = [];
+  if (newSchool === 2) {            // 1 → 2: subject details move hint → blacklist
+    state.hint = state.hint.filter(t => {
+      if (isSubjectish(t)) { moved.push(t); return false; }
+      return true;
+    });
+    for (const t of moved) for (const p of wildcardize(t)) if (!state.blacklist.includes(p)) state.blacklist.push(p);
+  } else {                          // 2 → 1: subject rules move blacklist → hint
+    const keep = [];
+    const movedSet = new Set();
+    for (const p of state.blacklist) {
+      if (p.startsWith('*') && p.endsWith('*')) {
+        const stem = p.slice(1, -1);
+        if (isSubjectish(stem)) { movedSet.add(stem); continue; }
+      }
+      keep.push(p);
+    }
+    state.blacklist = keep;
+    for (const t of movedSet) if (!state.hint.includes(t)) state.hint.push(t);
+    moved.push(...movedSet);
+  }
+  state.school = newSchool;
+  renderSchool();
+  renderChipsW(); renderChipsBL(); renderChipsH();
+  renderWordsPreview();
+  onAnyChange();
+  flipNote('flipped — moved ' + moved.length + ' tag' + (moved.length === 1 ? '' : 's') + ': ' + moved.slice(0, 6).join(', ') + (moved.length > 6 ? ' …' : ''));
+}
+
+function renderWordsPreview() {
+  const el = byId('wordsPreview');
+  el.innerHTML = '';
+  for (const w of state.words) {
+    const pats = wildcardize(w);
+    const matches = Object.keys(state.captionTags)
+      .filter(t => pats.some(p => p.startsWith('*') ? t.includes(p.slice(1, -1)) : t === p))
+      .sort();
+    const head = document.createElement('div');
+    head.className = 'pv-line';
+    head.textContent = w + ' → ' + pats.join(', ');
+    el.appendChild(head);
+    const sub = document.createElement('div');
+    sub.className = 'pv-line';
+    if (matches.length) {
+      sub.innerHTML = '<span class="n">' + matches.length + (matches.length === 1 ? ' tag matched' : ' tags matched') + ':</span> ' + matches.slice(0, 10).join(', ') + (matches.length > 10 ? ' …' : '');
+    } else {
+      sub.innerHTML = '<span class="none">0 matches in current captions</span> — no captions yet, or try a synonym';
+    }
+    el.appendChild(sub);
+  }
+}
+function generateWords() {
+  const raw = byId('wordsInput').value.split(/[, ]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (!raw.length) return;
+  byId('wordsInput').value = '';
+  for (const w of raw) {
+    if (!state.words.includes(w)) state.words.push(w);
+    for (const p of wildcardize(w)) if (!state.blacklist.includes(p)) state.blacklist.push(p);
+  }
+  renderWords(); renderBlacklist(); renderWordsPreview(); onAnyChange();
+}
+function removeWord(w) {
+  const pats = wildcardize(w);
+  state.blacklist = state.blacklist.filter(p => !pats.includes(p));
+}
+
+function renderJunk() {
+  const el = byId('junkChips');
+  el.innerHTML = '';
+  if (!state.junkOn) return;
+  for (const j of state.junk) {
+    const span = document.createElement('span');
+    span.className = 'chip junk';
+    span.textContent = j;
+    const x = document.createElement('button');
+    x.textContent = '✕';
+    x.onclick = () => { state.junk.splice(state.junk.indexOf(j), 1); renderJunk(); onAnyChange(); };
+    span.appendChild(x);
+    el.appendChild(span);
+  }
+}
+
+function fmtList(arr) { return '[ ' + arr.map(x => '"' + x + '"').join(', ') + ' ]'; }
+function renderToml() {
+  const lines = [
+    '# tagger.toml — written by the setup wizard (tagger --setup)',
+    '# dataset: ' + state.datasetName,
+    '',
+    'subject = "' + state.subject + '"',
+    'trigger = "' + state.trigger + '"',
+    '',
+    '# header: invariant tags, true for EVERY image',
+    'character = ' + fmtList(state.character),
+    '',
+    '# hint: identity that varies per image and must stay taggable',
+    'hint = ' + fmtList(state.hint),
+    '',
+    '# blacklist: never emitted. *word* = substring match',
+    'blacklist = ' + fmtList([...state.blacklist, ...(state.junkOn ? state.junk : [])]),
+  ];
+  const extras = [];
+  for (const k of ['temperature', 'max_tags', 'max_size', 'workers', 'base_url', 'model']) {
+    if (state.cfg[k] !== undefined) extras.push(k + ' = ' + (typeof state.cfg[k] === 'string' ? '"' + state.cfg[k] + '"' : state.cfg[k]));
+  }
+  if (extras.length) lines.push('', '# tuning (kept from your existing config)', ...extras);
+  byId('tomlPreview').textContent = lines.join('\n');
+}
+function renderTriggerMsg() {
+  const msg = byId('triggerMsg');
+  const t = state.trigger;
+  if (!t) { msg.className = 'warn'; msg.textContent = 'trigger is required'; }
+  else if (!/^[a-z0-9_]+$/.test(t)) { msg.className = 'warn'; msg.textContent = 'lowercase letters, digits and underscores only (no spaces)'; }
+  else { msg.className = 'ok'; msg.textContent = '✓ valid'; }
+}
+function renderDescs() {
+  byId('wordsDesc').textContent = state.school === 2
+    ? 'Plain words — materials, garments, props. Each word becomes a block rule (*word* = matches any tag containing it) so the model NEVER names the subject’s look; only the trigger does.'
+    : 'Words whose tags you want blocked (over-broad compounds, unwanted detail). Under School 1 the subject’s look stays taggable.';
+  byId('hintDesc').innerHTML = state.school === 2
+    ? 'Identity that changes between images and must STAY taggable (e.g. <code>face_paint</code>). Under School 2 this is only non-subject identity — the subject’s look belongs to the trigger.'
+    : 'The subject’s look, named as specific tags (e.g. <code>blue_armor</code>, <code>scale_mail</code>). Under School 1 the model tags the subject freely; hint pins the names of the variants.';
+}
+function onAnyChange() {
+  renderTriggerMsg();
+  renderDescs();
+  renderToml();
+}
+
+async function save() {
+  if (!state.trigger || !/^[a-z0-9_]+$/.test(state.trigger)) { alert('fix the trigger first: lowercase, digits, underscores only'); return; }
+  const blacklist = [...state.blacklist];
+  if (state.junkOn) for (const j of state.junk) if (!blacklist.includes(j)) blacklist.push(j);
+  const r = await fetch('/api/setup-save', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ subject: state.subject, trigger: state.trigger, character: state.character, hint: state.hint, blacklist }),
+  });
+  const j = await r.json();
+  if (!j.ok) { alert('save failed: ' + (j.error || 'unknown')); return; }
+  const msg = byId('savedMsg');
+  msg.textContent = 'saved ✓ — ';
+  const a = document.createElement('a'); a.href = '/'; a.textContent = 'open the review grid →';
+  msg.appendChild(a);
+}
+
+async function init() {
+  const d = await (await fetch('/api/setup-config')).json();
+  state.captionTags = d.caption_tags || {};
+  state.datasetName = d.dataset || d.folder;
+  state.cfg = d.cfg || {};
+  if (d.cfg && Object.keys(d.cfg).length) {
+    state.subject = d.cfg.subject || 'character';
+    state.trigger = d.cfg.trigger || '';
+    state.character = [...(d.cfg.character || [])];
+    state.hint = [...(d.cfg.hint || [])];
+    const junk = d.junk || [];
+    const bl = d.cfg.blacklist || [];
+    state.blacklist = bl.filter(x => !junk.includes(x));
+    state.junk = bl.filter(x => junk.includes(x));
+    state.junkOn = state.junk.length > 0;
+    const stems = [...new Set(bl.filter(x => x.startsWith('*') && x.endsWith('*'))
+      .map(x => x.slice(1, -1)).filter(s => /^[a-z0-9_]{4,}$/.test(s)))];
+    state.words = stems;
+    state.school = stems.filter(isLookish).length >= 3 ? 2 : 1;
+  } else {
+    state.junk = [...d.junk];
+    state.junkOn = true;
+  }
+  FULL_JUNK = [...d.junk];
+  renderSubject(); renderSchool();
+  renderChipsC(); renderChipsH(); renderChipsBL(); renderChipsW();
+  renderWordsPreview();
+  renderJunk();
+  onAnyChange();
+  if (d.cfg && Object.keys(d.cfg).length && state.words.length) flipNote('loaded existing config — School ' + state.school + ' inferred from ' + state.words.length + ' subject words');
+}
+
+const renderChipsH = bindChips(byId('hintChips'), state.hint, null, null, onAnyChange);
+const renderChipsBL = bindChips(byId('blacklistChips'), state.blacklist, null, null, onAnyChange);
+const renderChipsW = bindChips(byId('wordsChips'), state.words, 'gen', removeWord, () => { renderWordsPreview(); onAnyChange(); });
+const renderChipsC = bindChips(byId('characterChips'), state.character, null, null, onAnyChange);
+let FULL_JUNK = [];
+
+bindInput(byId('characterInput'), byId('characterAdd'), state.character, renderChipsC);
+byId('hintAdd').onclick = () => { addChip(state.hint, byId('hintInput')); renderChipsH(); onAnyChange(); };
+byId('hintInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); byId('hintAdd').onclick(); }
+  else if (e.key === ',' && byId('hintInput').value.trim()) { e.preventDefault(); byId('hintAdd').onclick(); }
+});
+
+byId('wordsAdd').onclick = generateWords;
+byId('wordsInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); generateWords(); } });
+byId('trigger').addEventListener('input', e => { state.trigger = e.target.value.trim(); onAnyChange(); });
+byId('junkOn').addEventListener('change', e => {
+  state.junkOn = e.target.checked;
+  if (state.junkOn && !state.junk.length) state.junk = [...FULL_JUNK];
+  renderJunk(); onAnyChange();
+});
+byId('saveBtn').onclick = save;
+
+init();
+</script>
+</body>
+</html>"""
+
+
+META_JUNK = ["watermark", "signature", "censored", "commentary", "translated",
+             "bad_id", "bad_pixiv_id", "score_*", "rating_*", "text_focus",
+             "logo", "monochrome", "greyscale", "multiple_views", "reference_sheet"]
+
+
+def sanitize_list(items) -> list[str]:
+    """Strip, drop empties, dedupe preserving order."""
+    out = []
+    for x in items or []:
+        s = str(x).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def fmt_toml_list(items) -> str:
+    return f'[ { ", ".join(f"\"{x}\"" for x in items) } ]'
+
+
+def setup_payload(folder: str) -> dict:
+    """Prefill + preview data for the setup wizard."""
+    cfg = {}
+    path = os.path.join(folder, "tagger.toml")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+    tags: dict[str, int] = {}
+    for f in os.listdir(folder):
+        if f.lower().endswith(".txt"):
+            content = open(os.path.join(folder, f), encoding="utf-8").read()
+            for t in parse_tag_list(content):
+                tags[t] = tags.get(t, 0) + 1
+    return {"folder": folder, "dataset": os.path.basename(folder),
+            "exists": bool(cfg), "cfg": cfg,
+            "caption_tags": tags, "junk": META_JUNK}
+
+
+def setup_save(folder: str, body: dict) -> dict:
+    """Validate the wizard form and write tagger.toml (keeping existing tunables)."""
+    subject = str(body.get("subject", ""))
+    trigger = str(body.get("trigger", "")).strip()
+    if subject not in ("character", "outfit", "style"):
+        return {"ok": False, "error": f"subject must be character|outfit|style, got {subject!r}"}
+    if not re.match(r"^[a-z0-9_]+$", trigger):
+        return {"ok": False,
+                "error": "trigger must be lowercase snake_case (a-z, 0-9, _)"}
+    character = sanitize_list(body.get("character"))
+    hint = sanitize_list(body.get("hint"))
+    blacklist = sanitize_list(body.get("blacklist"))
+    path = os.path.join(folder, "tagger.toml")
+    tunables: dict = {}
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            tunables = tomllib.load(f)
+    lines = [
+        "# tagger.toml - written by the setup wizard (tagger --setup)",
+        f"# dataset: {os.path.basename(folder)}",
+        "",
+        f'subject = "{subject}"   # what are we training: character | outfit | style',
+        f'trigger = "{trigger}"   # the word that summons the subject',
+        "",
+        "# header: invariant tags, true for EVERY image",
+        f"character = {fmt_toml_list(character)}",
+        "",
+        "# hint: identity that varies per image and must stay taggable",
+        f"hint = {fmt_toml_list(hint)}",
+        "",
+        "# blacklist: never emitted. *word* = substring match",
+        f"blacklist = {fmt_toml_list(blacklist)}",
+    ]
+    keep = {k: v for k, v in tunables.items()
+            if k not in ("subject", "trigger", "character", "hint", "blacklist")}
+    if keep:
+        lines.append("")
+        lines.append("# tuning (kept from your previous config)")
+        for k, v in keep.items():
+            if isinstance(v, list):
+                lines.append(f"{k} = {fmt_toml_list(v)}")
+            elif isinstance(v, str):
+                lines.append(f'{k} = "{v}"')
+            else:
+                lines.append(f"{k} = {v}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    logger.info("setup wizard wrote config: %s", path)
+    return {"ok": True, "path": path}
+
+
 def build_review_data(folder: str) -> dict:
     """Snapshot of the folder for the review grid: images + captions + flags."""
     images = sorted((f for f in os.listdir(folder)
@@ -724,8 +1255,8 @@ def build_review_data(folder: str) -> dict:
                       "singleton_tags": singleton_tags, "orphan_txt": orphan_txt}}
 
 
-def make_review_handler(folder: str):
-    """HTTP handler factory for the review grid (thumbnails, data, saves)."""
+def make_app_handler(folder: str):
+    """HTTP handler factory for the local app (review grid + setup wizard)."""
     _thumb_cache: dict = {}
 
     def _thumb(name: str, size: int) -> bytes:
@@ -766,6 +1297,12 @@ def make_review_handler(folder: str):
                     "text/html; charset=utf-8")
             if parsed.path == "/api/data":
                 return self._json(build_review_data(folder))
+            if parsed.path == "/setup":
+                return self._respond(
+                    SETUP_HTML.replace("{{FOLDER}}", folder).encode("utf-8"),
+                    "text/html; charset=utf-8")
+            if parsed.path == "/api/setup-config":
+                return self._json(setup_payload(folder))
             if parsed.path.startswith("/img/"):
                 name = os.path.basename(
                     urllib.parse.unquote(parsed.path[len("/img/"):]))
@@ -789,24 +1326,27 @@ def make_review_handler(folder: str):
             self.send_error(404)
 
         def do_POST(self):
-            if urllib.parse.urlparse(self.path).path != "/api/save":
-                return self.send_error(404)
+            path = urllib.parse.urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             try:
                 body = json.loads(self.rfile.read(length) or b"{}")
             except Exception:
                 return self._json({"ok": False, "error": "bad json"}, 400)
-            name = os.path.basename(str(body.get("name", "")))
-            caption = str(body.get("caption", "")).strip()
-            full = os.path.join(folder, name)
-            if not (os.path.isfile(full)
-                    and os.path.splitext(name)[1].lower() in IMAGE_EXTS):
-                return self._json({"ok": False, "error": "unknown image"}, 400)
-            txt = os.path.join(folder, os.path.splitext(name)[0] + ".txt")
-            with open(txt, "w", encoding="utf-8") as f:
-                f.write(caption)
-            logger.info("review save: %s (%d chars)", name, len(caption))
-            return self._json({"ok": True, "name": name})
+            if path == "/api/save":
+                name = os.path.basename(str(body.get("name", "")))
+                caption = str(body.get("caption", "")).strip()
+                full = os.path.join(folder, name)
+                if not (os.path.isfile(full)
+                        and os.path.splitext(name)[1].lower() in IMAGE_EXTS):
+                    return self._json({"ok": False, "error": "unknown image"}, 400)
+                txt = os.path.join(folder, os.path.splitext(name)[0] + ".txt")
+                with open(txt, "w", encoding="utf-8") as f:
+                    f.write(caption)
+                logger.info("review save: %s (%d chars)", name, len(caption))
+                return self._json({"ok": True, "name": name})
+            if path == "/api/setup-save":
+                return self._json(setup_save(folder, body))
+            self.send_error(404)
 
         def log_message(self, fmt, *args):
             pass
@@ -814,13 +1354,13 @@ def make_review_handler(folder: str):
     return ReviewHandler
 
 
-def review_folder(folder: str, port: int, open_browser: bool):
-    """Serve the human review grid until Ctrl+C."""
+def serve_app(folder: str, port: int, page: str, open_browser: bool):
+    """Serve the local web app (review grid or setup wizard) until Ctrl+C."""
     if not any(os.path.splitext(f)[1].lower() in IMAGE_EXTS
                for f in os.listdir(folder)):
         sys.exit(f"no images ({', '.join(sorted(IMAGE_EXTS))}) found in {folder}")
-    url = f"http://127.0.0.1:{port}"
-    print(f"review grid: {url}  (Ctrl+C to stop)")
+    url = f"http://127.0.0.1:{port}{'/setup' if page == 'setup' else ''}"
+    print(f"tagger {'setup wizard' if page == 'setup' else 'review grid'}: {url}  (Ctrl+C to stop)")
     if open_browser:
         try:
             webbrowser.open(url)
@@ -828,7 +1368,7 @@ def review_folder(folder: str, port: int, open_browser: bool):
             pass
     try:
         ThreadingHTTPServer(("127.0.0.1", port),
-                            make_review_handler(folder)).serve_forever()
+                            make_app_handler(folder)).serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
     except OSError as e:
@@ -957,7 +1497,11 @@ def main(argv=None):
         return
 
     if args.review:
-        review_folder(args.folder, args.port, not args.no_browser)
+        serve_app(args.folder, args.port, "review", not args.no_browser)
+        return
+
+    if args.setup:
+        serve_app(args.folder, args.port, "setup", not args.no_browser)
         return
 
     try:
