@@ -9,11 +9,15 @@ next to each image — the standard kohya/ai-toolkit dataset layout.
 import argparse
 import base64
 import io
+import json
 import os
 import re
 import sys
 import time
+import urllib.parse
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 import tomllib
@@ -144,7 +148,8 @@ def parse_args(argv):
                "  tagger . --subject style --trigger mystyle\n"
                "  tagger . --hint \"face_paint\" --blacklist \"fantasy_*, ornate\"\n"
                "  tagger . --save-config                   # persist settings to tagger.toml\n"
-               "  tagger . --init-config                   # write a commented starter tagger.toml",
+               "  tagger . --init-config                   # write a commented starter tagger.toml\n"
+               "  tagger . --review                        # human review grid in the browser",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("folder", nargs="?", default=".",
@@ -199,6 +204,14 @@ def parse_args(argv):
     p.add_argument("--audit", action="store_true",
                    help="no tagging: print the tag frequency report over EXISTING .txt captions "
                         "(the human review pass; works without LM Studio)")
+    p.add_argument("--review", action="store_true",
+                   help="open the human review grid in the browser: thumbnails + click-to-edit "
+                        "captions, singleton/empty/missing flags; saves straight back to .txt "
+                        "(no LM Studio needed)")
+    p.add_argument("--port", type=int, default=8765,
+                   help="port for the --review web UI (default: 8765)")
+    p.add_argument("--no-browser", action="store_true",
+                   help="with --review: start the server without opening a browser")
     return p.parse_args(argv)
 
 
@@ -485,6 +498,344 @@ def audit_folder(folder: str):
     print_tag_report(counts, captioned)
 
 
+REVIEW_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tagger review — {{FOLDER}}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#141414; color:#ddd; }
+  header { position:sticky; top:0; z-index:10; background:#1b1b1b; border-bottom:1px solid #2c2c2c; padding:10px 16px; }
+  h1 { font-size:15px; margin:0 0 8px; color:#fff; font-weight:600; }
+  h1 small { color:#888; font-weight:400; }
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .stats { font-size:13px; color:#aaa; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; }
+  .chip { background:#2a2a2a; border:1px solid #3a3a3a; border-radius:12px; padding:2px 10px; font-size:12px; cursor:pointer; }
+  .chip:hover { background:#333; }
+  .chip.on { background:#5a1f1f; border-color:#ff8787; }
+  .chip.single { color:#ff8787; }
+  select, .btn { background:#2a2a2a; color:#ddd; border:1px solid #3a3a3a; border-radius:6px; padding:4px 10px; font-size:13px; cursor:pointer; }
+  .btn:hover { background:#333; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:14px; padding:16px; }
+  .card { background:#1b1b1b; border:1px solid #2c2c2c; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }
+  .card img { width:100%; aspect-ratio:4/3; object-fit:contain; background:#000; display:block; }
+  .bar { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 10px; font-size:12px; color:#999; }
+  .badge { font-size:10px; font-weight:700; letter-spacing:.5px; padding:2px 7px; border-radius:8px; }
+  .b-ok { display:none; }
+  .b-empty { background:#5a4a1f; color:#ffd43b; }
+  .b-missing { background:#5a1f1f; color:#ff8787; }
+  .cap { padding:0 10px 10px; display:flex; flex-direction:column; gap:8px; }
+  .view { font:12px/1.5 ui-monospace, monospace; color:#ddd; padding:8px; background:#131313; border:1px dashed #333; border-radius:6px; cursor:text; }
+  .view:hover { border-color:#555; }
+  .hint { font-size:12px; color:#777; font-style:italic; padding:8px; border:1px dashed #333; border-radius:6px; cursor:text; }
+  mark.need { background:#5a1f1f; color:#ff8787; border-radius:3px; padding:0 2px; }
+  textarea { width:100%; min-height:90px; resize:vertical; background:#131313; color:#ddd; border:1px solid #444; border-radius:6px; padding:8px; font:12px/1.5 ui-monospace, monospace; }
+  .btns { display:flex; gap:8px; }
+  .saved { color:#69db7c; font-size:12px; }
+  .foot { padding:0 16px 20px; font-size:12px; color:#777; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tagger review <small>— {{FOLDER}}</small></h1>
+  <div class="row">
+    <span class="stats" id="stats"></span>
+    <select id="filter">
+      <option value="all">all images</option>
+      <option value="attention">⚠ needs attention</option>
+      <option value="ok">captioned only</option>
+      <option value="empty">empty / missing</option>
+    </select>
+    <button class="btn" onclick="load()">↻ refresh flags</button>
+    <span style="font-size:12px;color:#666" id="shown"></span>
+  </div>
+  <div class="chips" id="chips"></div>
+</header>
+<main>
+  <div class="grid" id="grid"></div>
+  <div class="foot">click a caption to edit · Ctrl+Enter saves · Esc cancels · red tags appear on only 1 image (hallucination / rare-variant suspects)</div>
+</main>
+<script>
+"use strict";
+const state = { data: null, filter: 'all', tagFilter: null };
+
+async function load() {
+  const r = await fetch('/api/data');
+  state.data = await r.json();
+  render();
+}
+
+function render() {
+  const d = state.data;
+  if (!d) return;
+  document.getElementById('stats').textContent =
+    d.stats.captioned + '/' + d.stats.total + ' captioned · ' + d.stats.empty + ' empty · ' + d.stats.missing + ' missing' +
+    (d.stats.orphan_txt.length ? ' · ⚠ ' + d.stats.orphan_txt.length + ' orphan .txt: ' + d.stats.orphan_txt.join(', ') : '');
+  const chips = document.getElementById('chips');
+  chips.innerHTML = '';
+  if (!d.stats.singleton_tags.length) {
+    const c = document.createElement('span');
+    c.className = 'chip';
+    c.textContent = 'no singleton tags 🎉';
+    chips.appendChild(c);
+  }
+  for (const t of d.stats.singleton_tags) {
+    const c = document.createElement('span');
+    c.className = 'chip single' + (state.tagFilter === t ? ' on' : '');
+    c.textContent = t + ' ×1';
+    c.title = 'click to show only images with this tag';
+    c.onclick = () => { state.tagFilter = state.tagFilter === t ? null : t; render(); };
+    chips.appendChild(c);
+  }
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  for (const img of d.images) if (passes(img)) grid.appendChild(card(img));
+  document.getElementById('shown').textContent = 'showing ' + grid.children.length + '/' + d.images.length;
+}
+
+function passes(img) {
+  if (state.tagFilter && !img.singletons.includes(state.tagFilter)) return false;
+  switch (state.filter) {
+    case 'attention': return img.singletons.length > 0 || img.state !== 'ok';
+    case 'ok': return img.state === 'ok';
+    case 'empty': return img.state !== 'ok';
+    default: return true;
+  }
+}
+
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function card(img) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  const im = document.createElement('img');
+  im.src = '/img/' + encodeURIComponent(img.name) + '?size=340';
+  im.loading = 'lazy';
+  im.alt = img.name;
+  el.appendChild(im);
+  const bar = document.createElement('div'); bar.className = 'bar';
+  const nm = document.createElement('span'); nm.textContent = img.name;
+  const badge = document.createElement('span');
+  badge.className = 'badge ' + (img.state === 'empty' ? 'b-empty' : img.state === 'missing' ? 'b-missing' : 'b-ok');
+  badge.textContent = img.state === 'empty' ? 'EMPTY' : img.state === 'missing' ? 'NO CAPTION' : '';
+  bar.appendChild(nm); bar.appendChild(badge);
+  el.appendChild(bar);
+  const cap = document.createElement('div'); cap.className = 'cap';
+  if (img.state === 'ok') {
+    const view = document.createElement('div'); view.className = 'view';
+    const sg = new Set(img.singletons);
+    view.innerHTML = img.caption.split(',').map(t => t.trim()).filter(Boolean)
+      .map(t => sg.has(t) ? '<mark class="need">' + esc(t) + '</mark>' : esc(t)).join(', ');
+    view.title = 'click to edit';
+    view.onclick = () => editMode(el, img, cap);
+    cap.appendChild(view);
+  } else {
+    const hint = document.createElement('div'); hint.className = 'hint';
+    hint.textContent = 'no caption yet — click to write one';
+    hint.onclick = () => editMode(el, img, cap);
+    cap.appendChild(hint);
+  }
+  el.appendChild(cap);
+  return el;
+}
+
+function editMode(el, img, cap) {
+  const ta = document.createElement('textarea');
+  ta.value = img.caption || '';
+  const btns = document.createElement('div'); btns.className = 'btns';
+  const save = document.createElement('button'); save.className = 'btn'; save.textContent = 'save';
+  const cancel = document.createElement('button'); cancel.className = 'btn'; cancel.textContent = 'cancel';
+  save.onclick = () => saveImg(el, img, ta.value);
+  cancel.onclick = () => render();
+  btns.appendChild(save); btns.appendChild(cancel);
+  cap.innerHTML = '';
+  cap.appendChild(ta); cap.appendChild(btns);
+  ta.focus();
+  ta.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); saveImg(el, img, ta.value); }
+    if (e.key === 'Escape') render();
+  });
+}
+
+async function saveImg(el, img, text) {
+  const r = await fetch('/api/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: img.name, caption: text })
+  });
+  const j = await r.json();
+  if (!j.ok) { alert('save failed: ' + (j.error || 'unknown')); return; }
+  img.caption = text; img.state = text.trim() ? 'ok' : 'empty';
+  const badge = el.querySelector('.badge');
+  if (text.trim()) { badge.textContent = ''; badge.className = 'badge b-ok'; }
+  else { badge.textContent = 'EMPTY'; badge.className = 'badge b-empty'; }
+  const msg = document.createElement('div'); msg.className = 'saved'; msg.textContent = 'saved ✓';
+  el.querySelector('.cap').appendChild(msg);
+  setTimeout(() => msg.remove(), 1500);
+}
+
+document.getElementById('filter').addEventListener('change', e => { state.filter = e.target.value; render(); });
+load();
+</script>
+</body>
+</html>"""
+
+
+def build_review_data(folder: str) -> dict:
+    """Snapshot of the folder for the review grid: images + captions + flags."""
+    images = sorted((f for f in os.listdir(folder)
+                     if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+                     and os.path.isfile(os.path.join(folder, f))),
+                    key=natural_key)
+    counts: dict[str, int] = {}
+    entries = []
+    empty = missing = 0
+    for name in images:
+        stem = os.path.splitext(name)[0]
+        txt = os.path.join(folder, stem + ".txt")
+        exists = os.path.exists(txt)
+        content = open(txt, encoding="utf-8").read().strip() if exists else ""
+        if exists and not content:
+            empty += 1
+        if not exists:
+            missing += 1
+        for t in parse_tag_list(content):
+            counts[t] = counts.get(t, 0) + 1
+        entries.append({"name": name, "caption": content,
+                        "state": "ok" if content else ("empty" if exists else "missing"),
+                        "singletons": []})
+    singleton_tags = sorted(t for t, n in counts.items() if n == 1)
+    singleton_set = set(singleton_tags)
+    for e in entries:
+        e["singletons"] = sorted(t for t in parse_tag_list(e["caption"])
+                                  if t in singleton_set)
+    image_stems = {os.path.splitext(n)[0] for n in images}
+    orphan_txt = sorted(f for f in os.listdir(folder)
+                        if f.lower().endswith(".txt")
+                        and os.path.splitext(f)[0] not in image_stems)
+    return {"folder": folder, "images": entries,
+            "stats": {"total": len(images),
+                      "captioned": sum(1 for e in entries if e["state"] == "ok"),
+                      "empty": empty, "missing": missing,
+                      "singleton_tags": singleton_tags, "orphan_txt": orphan_txt}}
+
+
+def make_review_handler(folder: str):
+    """HTTP handler factory for the review grid (thumbnails, data, saves)."""
+    _thumb_cache: dict = {}
+
+    def _thumb(name: str, size: int) -> bytes:
+        key = (name, size)
+        if key in _thumb_cache:
+            return _thumb_cache[key]
+        with Image.open(os.path.join(folder, name)) as im:
+            im = im.convert("RGB")
+            im.thumbnail((size, size), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=85)
+            blob = buf.getvalue()
+        if len(_thumb_cache) > 300:
+            _thumb_cache.clear()
+        _thumb_cache[key] = blob
+        return blob
+
+    class ReviewHandler(BaseHTTPRequestHandler):
+        def _respond(self, blob: bytes, ctype: str, status: int = 200,
+                     cache: bool = False):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(blob)))
+            if cache:
+                self.send_header("Cache-Control", "max-age=3600")
+            self.end_headers()
+            self.wfile.write(blob)
+
+        def _json(self, obj, status: int = 200):
+            self._respond(json.dumps(obj).encode("utf-8"),
+                          "application/json", status)
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/":
+                return self._respond(
+                    REVIEW_HTML.replace("{{FOLDER}}", folder).encode("utf-8"),
+                    "text/html; charset=utf-8")
+            if parsed.path == "/api/data":
+                return self._json(build_review_data(folder))
+            if parsed.path.startswith("/img/"):
+                name = os.path.basename(
+                    urllib.parse.unquote(parsed.path[len("/img/"):]))
+                full = os.path.join(folder, name)
+                ext = os.path.splitext(name)[1].lower()
+                if not (os.path.isfile(full) and ext in IMAGE_EXTS):
+                    return self.send_error(404)
+                qs = urllib.parse.parse_qs(parsed.query)
+                try:
+                    size = int(qs.get("size", ["0"])[0])
+                except ValueError:
+                    size = 0
+                if size > 0:
+                    blob = _thumb(name, size)
+                    return self._respond(blob, "image/jpeg", cache=True)
+                with open(full, "rb") as f:
+                    blob = f.read()
+                ctype = {".png": "image/png", ".webp": "image/webp"}.get(
+                    ext, "image/jpeg")
+                return self._respond(blob, ctype, cache=True)
+            self.send_error(404)
+
+        def do_POST(self):
+            if urllib.parse.urlparse(self.path).path != "/api/save":
+                return self.send_error(404)
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                return self._json({"ok": False, "error": "bad json"}, 400)
+            name = os.path.basename(str(body.get("name", "")))
+            caption = str(body.get("caption", "")).strip()
+            full = os.path.join(folder, name)
+            if not (os.path.isfile(full)
+                    and os.path.splitext(name)[1].lower() in IMAGE_EXTS):
+                return self._json({"ok": False, "error": "unknown image"}, 400)
+            txt = os.path.join(folder, os.path.splitext(name)[0] + ".txt")
+            with open(txt, "w", encoding="utf-8") as f:
+                f.write(caption)
+            logger.info("review save: %s (%d chars)", name, len(caption))
+            return self._json({"ok": True, "name": name})
+
+        def log_message(self, fmt, *args):
+            pass
+
+    return ReviewHandler
+
+
+def review_folder(folder: str, port: int, open_browser: bool):
+    """Serve the human review grid until Ctrl+C."""
+    if not any(os.path.splitext(f)[1].lower() in IMAGE_EXTS
+               for f in os.listdir(folder)):
+        sys.exit(f"no images ({', '.join(sorted(IMAGE_EXTS))}) found in {folder}")
+    url = f"http://127.0.0.1:{port}"
+    print(f"review grid: {url}  (Ctrl+C to stop)")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        ThreadingHTTPServer(("127.0.0.1", port),
+                            make_review_handler(folder)).serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    except OSError as e:
+        sys.exit(f"error: cannot bind port {port}: {e}\n"
+                 f"(is another instance running? use --port to change it)")
+
+
 def tag_batch(args, model: str, batch: list[tuple[str, str]], exact: set[str],
               prefixes: list[str], suffixes: list[str], contains: list[str],
               hint_set: set[str]) -> str:
@@ -603,6 +954,10 @@ def main(argv=None):
 
     if args.audit:
         audit_folder(args.folder)
+        return
+
+    if args.review:
+        review_folder(args.folder, args.port, not args.no_browser)
         return
 
     try:

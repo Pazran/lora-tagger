@@ -106,7 +106,32 @@ tagger . --character "1girl, elf, silver_hair" --trigger mychar
 tagger . --subject style --trigger mystyle
 tagger . --hint "face_paint" --blacklist "fantasy_*, ornate"
 tagger . --audit                        # frequency report over existing captions (no API)
+tagger . --review                       # human review grid in the browser (no API)
 ```
+
+## Review grid (`--review`)
+
+The human pass, upgraded from text to pictures. Starts a local web server and opens
+the dataset in the browser — no LM Studio needed:
+
+```bash
+tagger . --review            # opens http://127.0.0.1:8765
+```
+
+- **Grid of thumbnails + captions**, click any caption to edit inline
+  (Ctrl+Enter saves, Esc cancels; empty field clears the caption so it gets
+  re-tagged on the next run).
+- **Singleton tags highlighted in red** — tags appearing on only 1 image
+  (hallucination / rare-variant suspects). Click a chip in the header to
+  isolate just the images carrying that tag.
+- **Badges** for empty / missing captions; orphan `.txt` files listed in the
+  header stats.
+- **Saves write straight back to `.txt`** — exactly what the trainer sees,
+  and the resume logic never touches your edits.
+- Local-only (`127.0.0.1`), path-traversal safe, no upload, nothing leaves
+  your machine. `--port` to change the port, `--no-browser` to skip auto-open.
+
+`--audit` remains for headless checks; `--review` is the interactive version.
 
 ## Full pipeline (compose with renamer)
 
@@ -166,6 +191,9 @@ Built-in prompt rules apply to every dataset:
 | `--force` | off | re-tag non-empty captions; **asks for confirmation** before overwriting |
 | `--dry-run` | off | print captions, write nothing (no confirmation needed) |
 | `--audit` | off | print tag-frequency report over existing captions (no API) |
+| `--review` | off | human review grid in the browser (no API) |
+| `--port` | `8765` | port for `--review` |
+| `--no-browser` | off | with `--review`: don't auto-open the browser |
 | `--report` | off | print tag-frequency report after tagging |
 | `--save-config` | off | write `tagger.toml` into the dataset folder and exit |
 | `--init-config` | off | write a commented starter `tagger.toml` (refuses to overwrite) and exit |
